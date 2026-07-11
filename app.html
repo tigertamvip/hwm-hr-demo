@@ -6,8 +6,8 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<meta name="version" content="V0.6.1q-demo">
-<!-- cache-bust: 2026-07-11-09-15 -->
+<meta name="version" content="V0.6.1r-demo">
+<!-- cache-bust: 2026-07-11-09-45 -->
 <meta name="theme-color" content="#02314D">
 <link rel="manifest" href="manifest.json">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -3095,7 +3095,7 @@ console.log('HWM HR v20260603-kpi-v4 loaded');
 (function setBrandTexts(){
   var c=window.APP_CONFIG.company;
   var t=document.getElementById('portal-title');
-  if(t)t.textContent='MBO+AI';
+  if(t)t.textContent='进入MBO+AI目标计划管理系统';
   var f=document.getElementById('footer-copy');
   if(f)f.textContent='© '+c.copyright+' 版权所有';
 })();
@@ -3866,49 +3866,11 @@ function moduleBuilding(){
   var isDemo=(location.hostname==='demo.tiger-buddy.com'||location.hostname==='localhost'||location.hostname==='127.0.0.1');
   if(!isDemo)return;
   console.log('HWM DEMO ★ 演示环境 — 数据仅存储于浏览器本地 localStorage');
-
-  // Replace supabase with localStorage mock
   var _demoStore={};
   var _demoStoreKey=function(tbl){return 'demo_'+tbl;};
-  var _loadDemo=function(tbl){
-    try{var r=localStorage.getItem(_demoStoreKey(tbl));_demoStore[tbl]=r?JSON.parse(r):{};}catch(e){_demoStore[tbl]={};}
-  };
+  var _loadDemo=function(tbl){try{var r=localStorage.getItem(_demoStoreKey(tbl));_demoStore[tbl]=r?JSON.parse(r):{};}catch(e){_demoStore[tbl]={};}};
   var _saveDemo=function(tbl){localStorage.setItem(_demoStoreKey(tbl),JSON.stringify(_demoStore[tbl]));};
-  
-  window.supabase={
-    from:function(tbl){
-      _loadDemo(tbl);
-      var store=_demoStore[tbl];
-      return {
-        select:function(cols){return this;},
-        eq:function(k,v){
-          var results=[];
-          for(var id in store){if(store[id][k]===v)results.push(store[id]);}
-          return {then:function(cb){cb({data:results,error:null});return{then:function(cb2){cb2&&cb2({data:results,error:null});}};}};
-        },
-        insert:function(rows){
-          for(var i=0;i<rows.length;i++){var id=rows[i].id||('_'+Date.now()+'_'+i);store[id]=rows[i];store[id].id=id;}
-          _saveDemo(tbl);return {then:function(cb){cb({error:null});}};
-        },
-        update:function(obj){
-          return {eq:function(k,v){
-            for(var id in store){if(store[id][k]===v){for(var pk in obj)store[id][pk]=obj[pk];}}
-            _saveDemo(tbl);return {then:function(cb){cb({error:null});}};
-          }};
-        },
-        delete:function(){
-          return {eq:function(k,v){
-            for(var id in store){if(store[id][k]===v)delete store[id];}
-            _saveDemo(tbl);return {then:function(cb){cb({error:null});}};
-          }};
-        },
-        upsert:function(rows){
-          for(var i=0;i<rows.length;i++){var r=rows[i];var found=false;for(var id in store){if(store[id].empid===r.empid&&store[id].name===r.name){store[id]=r;found=true;break;}}if(!found){store['_'+Date.now()+'_'+i]=r;}}
-          _saveDemo(tbl);return {then:function(cb){cb({error:null});}};
-        }
-      };
-    }
-  };
+  window.supabase={from:function(tbl){_loadDemo(tbl);var store=_demoStore[tbl];return {select:function(cols){return this;},eq:function(k,v){var results=[];for(var id in store){if(store[id][k]===v)results.push(store[id]);}return {then:function(cb){cb({data:results,error:null});return{then:function(cb2){cb2&&cb2({data:results,error:null});}};}};},insert:function(rows){for(var i=0;i<rows.length;i++){var id=rows[i].id||('_'+Date.now()+'_'+i);store[id]=rows[i];store[id].id=id;}_saveDemo(tbl);return {then:function(cb){cb({error:null});}};},update:function(obj){return {eq:function(k,v){for(var id in store){if(store[id][k]===v){for(var pk in obj)store[id][pk]=obj[pk];}}_saveDemo(tbl);return {then:function(cb){cb({error:null});}};}};},delete:function(){return {eq:function(k,v){for(var id in store){if(store[id][k]===v)delete store[id];}_saveDemo(tbl);return {then:function(cb){cb({error:null});}};}};},upsert:function(rows){for(var i=0;i<rows.length;i++){var r=rows[i];var found=false;for(var id in store){if(store[id].empid===r.empid&&store[id].name===r.name){store[id]=r;found=true;break;}}if(!found){store['_'+Date.now()+'_'+i]=r;}}_saveDemo(tbl);return {then:function(cb){cb({error:null});}};}};}};};
 })();
 
 (function injectDemoUsers(){
