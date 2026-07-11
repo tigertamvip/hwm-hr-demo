@@ -5357,7 +5357,7 @@ function updateStats(){
   var mr=pool.filter(function(e){var d=parseD(e.resignDate);return d&&d>=ms&&d<=me;}).length;
   // 本月标题：支持 admin/data_admin 点击编辑月份
   var monthLabel=localStorage.getItem('stats_month_label')||(Y+'年'+(M+1)+'月');
-  var canEditMonth=(currentUser.role==='admin'||currentUser.role==='data_admin');
+  var canEditMonth=(currentUser&&(currentUser.role==='admin'||currentUser.role==='data_admin'));
   var monthEditClass=canEditMonth?' stats-month-editable':'';
   var monthEditHint=canEditMonth?' title="点击修改月份" style="cursor:pointer;border-bottom:1px dashed #02314D"':'';
   var b1='<div class="stats-box-title">本月情况（<span class="stats-month-text'+monthEditClass+'" '+monthEditHint+' onclick="editStatsMonth(event)">'+monthLabel+'</span>）</div>';
@@ -5611,7 +5611,7 @@ function _showDemogUnmatched(type){
 // ★ V0.1.99n: 编辑统计面板的月份标签（仅 admin/data_admin 可调用）
 function editStatsMonth(e){
   e.stopPropagation();
-  if(currentUser.role!=='admin'&&currentUser.role!=='data_admin')return;
+  if(!currentUser||(currentUser.role!=='admin'&&currentUser.role!=='data_admin'))return;
   var current=localStorage.getItem('stats_month_label')||(Y+'年'+(M+1)+'月');
   var input=prompt('请输入月份（格式：2026年5月）：',current);
   if(!input)return;
