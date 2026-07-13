@@ -6,8 +6,8 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<meta name="version" content="V0.6.1dv-demo">
-<!-- cache-bust: 2026-07-13-18-41 -->
+<meta name="version" content="V0.6.1dw-demo">
+<!-- cache-bust: 2026-07-13-18-55 -->
 <meta name="theme-color" content="#02314D">
 <link rel="manifest" href="manifest.json?v=bc">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -3228,7 +3228,7 @@ function togglePortalTips(){
   </div>
 </div>
 
-<script src="employees-data.js?v=17"></script>
+<script src="employees-data.js?v=18"></script>
 <!-- 员工照片(5MB)按需懒加载，不在初始加载时阻塞页面 -->
 <script>
 (function(){
@@ -3255,7 +3255,7 @@ function togglePortalTips(){
 <script>
 console.log('HWM HR v20260712-drawer-v6 loaded');
 // ===== pdf.js worker 配置 =====
-// V0.6.1dv-demo: 品牌文本注入（从 APP_CONFIG 读取，切换客户只需改 config.js）
+// V0.6.1dw-demo: 品牌文本注入（从 APP_CONFIG 读取，切换客户只需改 config.js）
 (function setBrandTexts(){
   var c=window.APP_CONFIG.company;
   var b=c.brandName||'HWM';
@@ -3268,7 +3268,7 @@ console.log('HWM HR v20260712-drawer-v6 loaded');
   var f=document.getElementById('footer-copy');
   if(f)f.textContent='© '+c.copyright+' 版权所有';
 })();
-// V0.6.1dv-demo: 品牌图标文本注入
+// V0.6.1dw-demo: 品牌图标文本注入
 (function setBrandIcon(){
   var c=window.APP_CONFIG.company;
   var text=encodeURIComponent(c.iconText||'HWM');
@@ -3346,18 +3346,61 @@ function _effectivePerms(u){
 function _defaultReports(){ return {boss:'',supervisor:'',subordinates:[]}; }
 
 var _DEFAULT_USERS={
-  '李欣华':{pwd:'123',name:'李欣华',role:'center_head',centerKeyword:'海外销售',dept:'营销中心（海外）',position:'负责人',permissions:_defaultPerms('center_head'),reports:_defaultReports()},
-  '刘星梦':{pwd:'123',name:'刘星梦',role:'center_head',centerKeyword:'质量管理',dept:'质量管理中心',position:'负责人',permissions:_defaultPerms('center_head'),reports:_defaultReports()},
-  '谭晨航':{pwd:'6688',name:'谭晨航',role:'admin',dept:'人力资源部',position:'人力资源总监',permissions:_defaultPerms('admin'),reports:_defaultReports(),subordinates:{'赵小姣':'direct','尤亚君':'direct'}},
-  '赵小姣':{pwd:'123',name:'赵小姣',role:'staff',dept:'人力资源部',position:'人资专员',permissions:_defaultPerms('staff'),reports:_defaultReports(),subordinates:{'钟雅洁':'direct'}},
-  '尤亚君':{pwd:'123',name:'尤亚君',role:'staff',dept:'行政部',position:'副总经理助理',permissions:_defaultPerms('staff'),reports:_defaultReports()},
-  '葛师师':{pwd:'123',name:'葛师师',role:'center_head',centerKeyword:'研发',dept:'研发中心',position:'经理',permissions:_defaultPerms('center_head'),reports:_defaultReports()},
-  '杨成':{pwd:'123',name:'杨成',role:'center_head',centerKeyword:'营销中心',dept:'营销中心（国内）',position:'负责人',permissions:_defaultPerms('center_head'),reports:_defaultReports()},
-  '韩铁工':{pwd:'123',name:'韩铁工',role:'senior',dept:'总经办',position:'董事长',permissions:_defaultPerms('senior'),reports:_defaultReports()},
-  '张向利':{pwd:'123',name:'张向利',role:'center_head',centerKeyword:'供应链',dept:'供应链',position:'总监',permissions:_defaultPerms('center_head'),reports:_defaultReports()},
-  '徐亮':{pwd:'123',name:'徐亮',role:'center_head',centerKeyword:'财务',dept:'财务部',position:'负责人',permissions:_defaultPerms('center_head'),reports:_defaultReports()},
-  '孙颖':{pwd:'110088',name:'孙颖',role:'staff',dept:'人力资源部',position:'人事专员',permissions:_defaultPerms('staff'),reports:_defaultReports()},
-  '管理员':{pwd:'123',name:'管理员',role:'admin',dept:'系统',position:'管理员',permissions:_defaultPerms('admin'),reports:_defaultReports()}
+'顾佳':{pwd:'12345',name:'顾佳',role:'staff',dept:'采购中心',position:'经理',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '仲子进':{pwd:'12345',name:'仲子进',role:'staff',dept:'营销中心',position:'销售总监',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '王鹏':{pwd:'12345',name:'王鹏',role:'staff',dept:'研发中心',position:'研发副总',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '唐爱珍':{pwd:'12345',name:'唐爱珍',role:'staff',dept:'采购中心',position:'仓储主管',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '范文越':{pwd:'12345',name:'范文越',role:'staff',dept:'研发中心',position:'研发工程师',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '张玉基':{pwd:'12345',name:'张玉基',role:'staff',dept:'总经办',position:'总经理',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '施慧娟':{pwd:'12345',name:'施慧娟',role:'staff',dept:'财务中心',position:'财务经理',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '邵强':{pwd:'12345',name:'邵强',role:'staff',dept:'营销中心',position:'销售工程师',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '李敏':{pwd:'12345',name:'李敏',role:'staff',dept:'生产中心',position:'生产专员',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '蔡亚珍':{pwd:'12345',name:'蔡亚珍',role:'staff',dept:'人力资源行政中心',position:'人力行政经理',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '孙依暄':{pwd:'12345',name:'孙依暄',role:'staff',dept:'采购中心',position:'采购助理',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '薛金鑫':{pwd:'12345',name:'薛金鑫',role:'staff',dept:'生产中心',position:'生产专员',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '杨烨':{pwd:'12345',name:'杨烨',role:'staff',dept:'生产中心',position:'计划专员',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '张梦':{pwd:'12345',name:'张梦',role:'staff',dept:'营销中心',position:'销售工程师',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '邵超凤':{pwd:'12345',name:'邵超凤',role:'staff',dept:'研发中心',position:'生产专员',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '贺陆青青':{pwd:'12345',name:'贺陆青青',role:'staff',dept:'研发中心',position:'资深研究员',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '吴云萍':{pwd:'12345',name:'吴云萍',role:'staff',dept:'研发中心',position:'研发工程师',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '洪霞':{pwd:'12345',name:'洪霞',role:'staff',dept:'研发中心',position:'研发主管',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '袁月贤':{pwd:'12345',name:'袁月贤',role:'staff',dept:'财务中心',position:'会计',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '卓浩':{pwd:'12345',name:'卓浩',role:'staff',dept:'研发中心',position:'研发工程师',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '华晨':{pwd:'12345',name:'华晨',role:'staff',dept:'CDMO中心',position:'注册经理',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '夏羽':{pwd:'12345',name:'夏羽',role:'staff',dept:'营销中心',position:'海外销售经理',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '张玉印':{pwd:'12345',name:'张玉印',role:'staff',dept:'采购中心',position:'设备工程师',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '陈贝贝':{pwd:'12345',name:'陈贝贝',role:'staff',dept:'研发中心',position:'研发工程师',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '张迁':{pwd:'12345',name:'张迁',role:'staff',dept:'CDMO中心',position:'注册工程师',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '薛延':{pwd:'12345',name:'薛延',role:'staff',dept:'质量中心',position:'QA工程师',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '王艳玲':{pwd:'12345',name:'王艳玲',role:'staff',dept:'研发中心',position:'资深研发工程师',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '朱小凤':{pwd:'12345',name:'朱小凤',role:'staff',dept:'营销中心',position:'产品经理',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '许来利':{pwd:'12345',name:'许来利',role:'staff',dept:'研发中心',position:'研发工程师',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '王博':{pwd:'12345',name:'王博',role:'staff',dept:'营销中心',position:'销售副总',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '赵洁岚':{pwd:'12345',name:'赵洁岚',role:'staff',dept:'生产中心',position:'生产主管',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '潘晓惠':{pwd:'12345',name:'潘晓惠',role:'staff',dept:'财务中心',position:'出纳',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '周玲':{pwd:'12345',name:'周玲',role:'staff',dept:'质量中心',position:'QC工程师',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '许浩':{pwd:'12345',name:'许浩',role:'staff',dept:'研发中心',position:'研发助理工程师',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '梅可栋':{pwd:'12345',name:'梅可栋',role:'staff',dept:'生产中心',position:'采购主管',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '范冬冬':{pwd:'12345',name:'范冬冬',role:'staff',dept:'生产中心',position:'配液专员',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '毕泳':{pwd:'12345',name:'毕泳',role:'staff',dept:'研发中心',position:'研发助理工程师',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '张玮':{pwd:'12345',name:'张玮',role:'staff',dept:'营销中心',position:'病毒质控品销售',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '李梦楠':{pwd:'12345',name:'李梦楠',role:'staff',dept:'营销中心',position:'产品经理',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '李华中':{pwd:'12345',name:'李华中',role:'staff',dept:'研发中心',position:'研发工程师',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '王梅君':{pwd:'12345',name:'王梅君',role:'staff',dept:'人力资源行政中心',position:'人事经理',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '徐德聚':{pwd:'12345',name:'徐德聚',role:'staff',dept:'总经办',position:'总助',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '朱静美':{pwd:'12345',name:'朱静美',role:'staff',dept:'质量中心',position:'',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '梁居正':{pwd:'12345',name:'梁居正',role:'staff',dept:'研发中心',position:'',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '徐沛':{pwd:'12345',name:'徐沛',role:'staff',dept:'生产中心',position:'',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '周向右':{pwd:'12345',name:'周向右',role:'staff',dept:'生产中心',position:'',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '顾安楠':{pwd:'12345',name:'顾安楠',role:'staff',dept:'资材中心',position:'',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '祭丽姗':{pwd:'12345',name:'祭丽姗',role:'staff',dept:'生产中心',position:'',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '梅亚':{pwd:'12345',name:'梅亚',role:'staff',dept:'资材中心',position:'',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '刘季敏':{pwd:'12345',name:'刘季敏',role:'staff',dept:'研发中心',position:'',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '陈归露':{pwd:'12345',name:'陈归露',role:'staff',dept:'生产中心',position:'',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '吴其文':{pwd:'12345',name:'吴其文',role:'staff',dept:'研发中心',position:'',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '陆潭':{pwd:'12345',name:'陆潭',role:'staff',dept:'研发中心',position:'',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '夏骏':{pwd:'12345',name:'夏骏',role:'staff',dept:'研发中心',position:'',permissions:_defaultPerms('staff'),reports:_defaultReports()},
+  '管理员':{pwd:'12345',name:'管理员',role:'admin',dept:'系统',position:'管理员',permissions:_defaultPerms('admin'),reports:_defaultReports()}
 };
 
 // USERS 从 localStorage 加载，回退到默认值
