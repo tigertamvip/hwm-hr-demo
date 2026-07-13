@@ -11,10 +11,10 @@
 // ===== 公司品牌 =====
 window.APP_CONFIG = {
   company: {
-    fullName: '康达医疗器械有限公司（演示版）',
-    shortName: '康达医疗',
-    address: '北京市海淀区',
-    copyright: '康达医疗器械有限公司',
+    fullName: '南京立顶医疗科技有限公司（演示版）',
+    shortName: '立顶医疗',
+    address: '南京市',
+    copyright: '南京立顶医疗科技有限公司',
   },
   
   brand: {
