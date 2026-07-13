@@ -312,11 +312,9 @@ function sysSaveUser(){
   }
 }
 
-async function sysDeleteUser(){
+function sysDeleteUser(){
   if(!_sysEditingUid)return;
-  var uName=USERS[_sysEditingUid]?.name||_sysEditingUid;
-  var ok=await _showConfirm('⚠️ 确定要删除用户「'+uName+'」吗？此操作不可恢复！<br><br>Are you sure you want to delete user "'+uName+'"? This action cannot be undone.');
-  if(!ok)return;
+  if(!confirm('确定要删除用户「'+(USERS[_sysEditingUid]?.name||_sysEditingUid)+'」吗？此操作不可恢复。'))return;
   var deletedUid=_sysEditingUid;
   delete USERS[deletedUid];
   saveUserSettings();

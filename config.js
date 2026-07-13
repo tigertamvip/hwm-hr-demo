@@ -1,4 +1,4 @@
-// ===== MBO+AI目标计划管理系统 配置 =====
+// ===== HWM AI 人力资源管理系统配置 =====
 // 部署到新客户时，只需修改此文件
 //
 // 新客户三步走：
@@ -11,21 +11,19 @@
 // ===== 公司品牌 =====
 window.APP_CONFIG = {
   company: {
-    fullName: '南京立顶医疗科技有限公司',
-    shortName: '立顶医疗',
-    brandName: 'Leading Med',
-    iconText: 'LM',
-    address: '南京市',
-    copyright: '南京立顶医疗科技有限公司',
+    fullName: '康达医疗器械有限公司（演示版）',
+    shortName: '康达医疗',
+    address: '北京市海淀区',
+    copyright: '康达医疗器械有限公司',
   },
   
   brand: {
-    primary:   '#02314D',
+    primary:   '#003472',
     techBlue:  '#1B6EC4',
     accent:    '#0F7BE1',
   },
   
-  aiContext: '南京立顶医疗科技有限公司（Leading）专注于医疗器械研发制造，设有采购中心、营销中心、研发中心、生产中心、财务中心、CDMO中心、质量中心及人力资源行政中心。核心业务涵盖医疗器械研发、生产、质量控制与国内外销售。',
+  aiContext: '康达医疗（KDMD）专注于II类/III类医疗器械研发制造，产品涵盖血糖监测系统、胰岛素泵、超声诊断设备、体外诊断试剂等。拥有GMP洁净车间和ISO13485认证，服务全国2000+医疗机构。核心团队：赵建国(总经理)、孙志远(研发)、郑海峰(营销)、周国强(生产)、钱明达(财务)。',
   
   features: {
     kpi:       true,
@@ -49,8 +47,8 @@ var SUPABASE_URL = 'https://xgysfujnhwgevmojzkbf.supabase.co';
 var SUPABASE_ANON_KEY = 'sb_publishable_dPt0sB5D8ZQ6ZdHt6wuvyA_MkjOeknx';
 
 // Supabase 数据表名（一般不需要改，除非客户有用到多项目共享表的需求）
-var SUPABASE_TABLE = 'hwm_employees';
-var SUPABASE_WP_TABLE = 'hwm_workplans';
-var SUPABASE_USERS_TABLE = 'hwm_users';
-var SUPABASE_JD_TABLE = 'hwm_jobdesc';
-var SUPABASE_FAV_TABLE = 'hwm_favorites';
+var SUPABASE_TABLE = 'demo_hwm_employees';
+var SUPABASE_WP_TABLE = 'demo_hwm_workplans';
+var SUPABASE_USERS_TABLE = 'demo_hwm_users';
+var SUPABASE_JD_TABLE = 'demo_hwm_jobdesc';
+var SUPABASE_FAV_TABLE = 'demo_hwm_favorites';
