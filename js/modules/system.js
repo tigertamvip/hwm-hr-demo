@@ -577,10 +577,11 @@ function sysRosterSync(){
       if(USERS[e.name])toRemove.push(e.name);
       continue;
     }
-    // 状态必须是白名单才走后续逻辑
+    // 状态必须是白名单才走后续逻辑（★空status默认当作"在职"处理）
     if(activeStatus.length>0){
       var isActive=false;
-      for(var as=0;as<activeStatus.length;as++){if(status===activeStatus[as]){isActive=true;break;}}
+      var chkStatus=status||'在职';
+      for(var as=0;as<activeStatus.length;as++){if(chkStatus===activeStatus[as]){isActive=true;break;}}
       if(!isActive){skipped.push(e);continue;}
     }
     // 职位过滤 — 工人/检验员等不导入
