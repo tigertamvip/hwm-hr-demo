@@ -51,8 +51,8 @@ window.APP_CONFIG = {
 
 // ===== Supabase 数据库配置 =====
 // 每个新客户需注册独立 Supabase 项目，替换以下地址和 Key
-var SUPABASE_URL = 'https://xgysfujnhwgevmojzkbf.supabase.co';
-var SUPABASE_ANON_KEY = 'sb_publishable_dPt0sB5D8ZQ6ZdHt6wuvyA_MkjOeknx';
+var SUPABASE_URL = 'https://bigjlksembhbyhfxnmig.supabase.co';
+var SUPABASE_ANON_KEY = 'sb_publishable_1Hv1jO3dM3G7TUH3WTcgYw_9xKOAx5z';
 
 // ★ V0.6.1ef: 智能同步 — 跳过无需系统账号的职位（工人/检验员/操作类/生产类等）
 // 模糊匹配：position 包含其中任一关键词即跳过
