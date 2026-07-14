@@ -83,31 +83,25 @@ function sysRenderUserTable(){
 function _recalcSysFixedColumns(){
   var table=document.getElementById('sysUserTable');
   if(!table)return;
-  var firstRow=table.querySelector('tbody tr');
-  if(!firstRow)return;
-  var tds=firstRow.querySelectorAll('td');
-  var fixedClasses=['sys-col-center','sys-col-dept','sys-col-name','sys-col-position','sys-col-uid','sys-col-action','sys-col-sub'];
-  // ★ V0.6.1.gq: 用 th 的 offsetWidth（th 不会被内容撑大）作为 left 计算基准
   var ths=table.querySelectorAll('thead th');
+  if(ths.length<7)return;
+  var fixedClasses=['sys-col-center','sys-col-dept','sys-col-name','sys-col-position','sys-col-uid','sys-col-action','sys-col-sub'];
+  // ★ V0.6.1.gr: 用 th 的 offsetWidth（th 不会被内容撑大）作为 left 计算基准
   var cumulative=0;
   for(var i=0;i<7;i++){
     var cls=fixedClasses[i];
-    var w=0;
-    // 优先用 th 宽度
+    var w=80;
     for(var h=0;h<ths.length;h++){
       if(ths[h].classList.contains(cls)){w=ths[h].offsetWidth;break;}
     }
-    if(w===0)w=80; // fallback
-    td.style.left=cumulative+'px';
     // 同步表头
     var ths2=table.querySelectorAll('thead th.'+cls);
     for(var k=0;k<ths2.length;k++)ths2[k].style.left=cumulative+'px';
-    // 同步所有 td (tr)
+    // 同步所有 tbody td
     var allTds=table.querySelectorAll('tbody td.'+cls);
     for(var t=0;t<allTds.length;t++)allTds[t].style.left=cumulative+'px';
     cumulative+=w;
   }
-  console.log('[V0.6.1.gq] fixed columns recalc: total width='+cumulative+'px');
 }
 
 function sysTogglePerm(uid,mod){
