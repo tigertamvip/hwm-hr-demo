@@ -1,5 +1,5 @@
 // ★ Demo 花名册 — Leading-花名册（2026-6-AI专用）
-window.__DATA_VERSION__ = 'demo-20260715-v6';
+window.__DATA_VERSION__ = 'demo-20260715-v7';
 var __PRELOADED_EMPLOYEES__ = [
   {
     "empId": "LD001",
