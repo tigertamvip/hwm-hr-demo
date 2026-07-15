@@ -670,22 +670,24 @@ function getAllIndirectSubordinates(uid){
   var allDirect={};
   for(var i=0;i<direct.length;i++)allDirect[direct[i]]=true;
   var indirect=[];
-  var visited={};
-  visited[uid]=true;
+  var seen={};
   // BFS 遍历所有下属的下属
   var queue=direct.slice();
   while(queue.length>0){
     var name=queue.shift();
+    if(seen[name])continue;
+    seen[name]=true;
     // 通过 name 反查 uid
     var subUid=null;
-    for(var id in USERS){if(USERS[id].name===name){subUid=id;break;}}
-    if(visited[subUid])continue;
-    visited[subUid]=true;
-    var subs=getSubordinates(subUid||'');
+    for(var id in USERS){if(USERS[id]&&USERS[id].name===name){subUid=id;break;}}
+    if(!subUid)continue;
+    var subs=getSubordinates(subUid);
     if(subs)for(var i=0;i<subs.length;i++){
       if(allDirect[subs[i]])continue; // 排除直属下属
-      indirect.push(subs[i]);
-      queue.push(subs[i]);
+      if(!seen[subs[i]]){
+        indirect.push(subs[i]);
+        queue.push(subs[i]);
+      }
     }
   }
   return indirect;
