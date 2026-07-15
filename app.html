@@ -4129,7 +4129,8 @@ function logout(){
 }
 
 // ===== 数据库 =====
-const DB_NAME='hr_personnel_db';
+// ★ V0.6.1.gr: Demo 数据版本 — 设为新值强制清空所有本地缓存（IndexedDB + localStorage）
+window.__DATA_VERSION__='demo-clean-20260715';
 const STORE_NAME='employees';
 const DB_VERSION=3;
 let db=null;
@@ -4710,10 +4711,21 @@ async function initApp(){
     var savedVer=localStorage.getItem('hwm_data_version')||'';
     if(currentVer&&savedVer!==currentVer){
       console.log('[v12] Data version changed: '+savedVer+' → '+currentVer+', clearing IndexedDB...');
+      // 清空 IndexedDB 员工数据
       var clrTx=db.transaction(STORE_NAME,'readwrite');
       clrTx.objectStore(STORE_NAME).clear();
       await new Promise(function(res,rej){clrTx.oncomplete=res;clrTx.onerror=rej;});
       dbData=[];
+      // ★ V0.6.1.gr: 同时清空所有 localStorage 数据（用户设置、周计划、收藏夹）
+      var keysToRemove=[];
+      for(var i=0;i<localStorage.length;i++){
+        var k=localStorage.key(i);
+        if(k&&(k.indexOf('HWM_')===0||k.indexOf('hwm_')===0||k.indexOf('HWM-')===0)){
+          keysToRemove.push(k);
+        }
+      }
+      keysToRemove.forEach(function(k){localStorage.removeItem(k);});
+      console.log('[v12] Cleared '+keysToRemove.length+' localStorage keys');
       localStorage.setItem('hwm_data_version',currentVer);
     }
     // 1. 优先从 IndexedDB 加载
