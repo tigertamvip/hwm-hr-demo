@@ -3164,7 +3164,7 @@ function startEditCell(cell){
       // ★ V0.6.1.gp: 自定义下拉（替代浏览器原生 datalist）
       var dropdown=document.createElement('div');
       dropdown.className='supporter-dropdown';
-      dropdown.style.cssText='display:none;position:absolute;top:100%;left:0;z-index:9999;background:#fff;border:1px solid #d1d5db;border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,.12);max-height:160px;overflow-y:auto;min-width:140px;font-size:12px';
+      dropdown.style.cssText='display:none;position:absolute;top:100%;left:0;z-index:9999;background:#fff;border:1px solid #d1d5db;border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,.12);max-height:160px;overflow-y:auto;min-width:180px;font-size:12px;white-space:nowrap;z-index:9999';
       editor.appendChild(inp);
       editor.appendChild(dropdown);
 
@@ -3194,7 +3194,8 @@ function startEditCell(cell){
         dropdown.style.display='block';
       }
 
-      inp.addEventListener('focus',function(){showDropdown(inp.value);});
+      // ★ V0.6.1.gs: focus时不主动弹下拉,等用户输入再弹(避免空白时显示全部员工)
+      inp.addEventListener('focus',function(){if(inp.value)showDropdown(inp.value);});
       inp.addEventListener('input',function(){showDropdown(inp.value);});
       inp.addEventListener('keydown',function(e){
         if(e.key==='Enter'||e.key===','||e.key==='，'){
