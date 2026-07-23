@@ -111,6 +111,10 @@ var _wpViewingShared=null; // ★ V0.5.79b: 被分享查看的人
 var _wpViewingMergedUrgent=false; // ★ V0.6.1df: 下属重急事项合并视图
 var _wpViewingMergedIndirect=false; // ★ V0.6.1do: 间接下属标记
 var _wpEditCell=null;
+// 本地编辑保护：在云端确认写入前，后台加载/轮询不得用旧快照覆盖刚输入的内容。
+var _wpDirtyPlanVersions={};
+// 当前云端加载代次：管理员频繁切换本人/下属/授权视图时，旧请求返回不得覆盖后一次视图的数据。
+var _wpLoadGeneration=0;
 var _wpLastRenderKey='';
 var _wpRevisionMode=false;
 // ★ V0.6.1cd: 表头双击排序状态
@@ -248,9 +252,14 @@ function getSharedToMeList(){
 
 function initWPModule(){
   try{
+    // ★ j75: 每次进入模块均重置共享查看状态，防止上次浏览残留导致本周任务不持久化
+    _wpViewingShared=null;
+    _wpViewingDeptMember=null;
+    _wpViewingSubordinate=null;
+    _wpViewingMergedUrgent=false;
+    _wpViewingMergedIndirect=false;
     // 确保 _wpCurrent 始终已初始化（防止跨会话状态丢失）
     if(!_wpCurrent)_wpCurrent={year:null,month:null,week:null,plan:null};
-    if(!_wpViewingDeptMember)_wpViewingDeptMember=null;
     // ★ 每次进入模块都重新加载当前用户的数据（修复切换用户后数据不刷新的bug）
     loadWPData();
     if(!_wpInited){
@@ -300,6 +309,53 @@ function getWPLocalStorageKey(){
   return 'hwm_workplans_'+user;
 }
 
+// ★ V0.6.1.j52: 周计划删除统一使用同一目标用户，避免“本地删了、云端仍在”
+function _wpTargetUser(){
+  return _wpViewingShared||_wpViewingSubordinate||_wpViewingDeptMember||(currentUser&&currentUser.name)||getCurrentEmployee().name;
+}
+function _wpIsForcedDeleted(user,weekId){
+  var list=window.HWM_FORCED_DELETED_PLANS||[];
+  for(var i=0;i<list.length;i++)if(list[i].username===user&&list[i].weekId===weekId)return true;
+  return false;
+}
+function _wpBackupKeys(key){return ['__hwm_backup__'+key,key+'_backup'];}
+function _wpRemoveBackups(key){
+  var keys=_wpBackupKeys(key);
+  for(var i=0;i<keys.length;i++){try{localStorage.removeItem(keys[i]);}catch(e){}}
+}
+function _wpCanForceDelete(){
+  var u=(currentUser&&USERS&&USERS[currentUser.name])||{};
+  return u.role==='admin'||u.role==='data_admin'||(currentUser&&(currentUser.role==='admin'||currentUser.role==='data_admin'));
+}
+async function _wpDeleteCloudPlan(user,weekId){
+  if(typeof supabase==='undefined'||!supabase||!supabase.from)return {skipped:true};
+  var resp=await supabase.from(SUPABASE_WP_TABLE).delete().eq('username',user).eq('week_id',weekId);
+  if(resp.error)throw resp.error;
+  return resp;
+}
+
+// 清除指定发起方在某周发出的全部协同请求。用于来源周计划删除，避免接收方保留孤儿协同任务。
+async function _clearCollabTasksFromSource(fromUid,weekId){
+  if(!fromUid||!weekId||typeof supabase==='undefined'||!supabase||!supabase.from)return 0;
+  var resp=await supabase.from(SUPABASE_WP_TABLE).select('username,plan_data').eq('week_id',weekId);
+  if(resp.error)throw resp.error;
+  var cleaned=0;
+  for(var i=0;i<(resp.data||[]).length;i++){
+    var row=resp.data[i], receiverPlan=row.plan_data;
+    if(!receiverPlan||!Array.isArray(receiverPlan.collab_tasks))continue;
+    var before=receiverPlan.collab_tasks.length;
+    receiverPlan.collab_tasks=receiverPlan.collab_tasks.filter(function(ct){
+      return !(ct&&ct.collab_from_uid===fromUid);
+    });
+    if(receiverPlan.collab_tasks.length===before)continue;
+    receiverPlan.updatedAt=new Date().toISOString();
+    var saved=await supabase.from(SUPABASE_WP_TABLE).upsert([{username:row.username,week_id:weekId,plan_data:receiverPlan,updated_at:receiverPlan.updatedAt}],{onConflict:'username,week_id'});
+    if(saved.error)throw saved.error;
+    cleaned+=before-receiverPlan.collab_tasks.length;
+  }
+  return cleaned;
+}
+
 // ★ V0.1.19: 批量修复当前用户所有周计划的脏数据
 // 修复场景：跨浏览器登录、UID迁移后 localStorage 中残留其他用户信息
 function fixAllPlanDirtyData(){
@@ -327,25 +383,72 @@ function fixAllPlanDirtyData(){
   }
 }
 
+// 协同响应状态由接收方回写云端，是独立于任务编辑时间的权威字段。
+// 即使发起方本地计划的 updatedAt 更晚，也必须合并该字段，避免“已接受”长期停留在灰色待响应。
+function _wpMergeCloudCollabStatuses(localPlan,cloudPlan){
+  if(!localPlan||!cloudPlan||!cloudPlan._collab_statuses)return false;
+  var cloudStatuses=cloudPlan._collab_statuses;
+  var localStatuses=localPlan._collab_statuses||{};
+  if(JSON.stringify(localStatuses)===JSON.stringify(cloudStatuses))return false;
+  localPlan._collab_statuses=JSON.parse(JSON.stringify(cloudStatuses));
+  return true;
+}
+
 function loadWPData(){
+  // ★ V0.6.1.j74: 每次调用递增代次，异步回调只在代次匹配时生效
+  var gen=++_wpLoadGeneration;
   // ① 先读 localStorage（秒出，不卡）
   try{_wpData=JSON.parse(localStorage.getItem(getWPLocalStorageKey())||'{}');}catch(e){_wpData={};}
-  // ★ V0.6.1eh: 备份恢复 — 当前数据为空但备份存在时自动恢复
+  // ★ V0.6.1eh/j52: 备份恢复 — 仅恢复未被明确删除的周计划
   var wpKey=getWPLocalStorageKey();
   if(Object.keys(_wpData).length===0){
     var backup=localStorage.getItem(wpKey+'_backup');
     if(backup){
-      try{var backupData=JSON.parse(backup);if(Object.keys(backupData).length>0){_wpData=backupData;localStorage.setItem(wpKey,backup);console.warn('[WP] 从本地备份恢复了 '+Object.keys(backupData).length+' 周的数据');if(typeof showToast==='function')showToast('🔄 从本地备份恢复了周计划数据');}}catch(e){}
+      try{
+        var backupData=JSON.parse(backup);
+        var deletedPrefix='hwm_wp_deleted_'+_wpTargetUser()+'_';
+        Object.keys(backupData).forEach(function(wk){
+          if(localStorage.getItem(deletedPrefix+wk)==='1')delete backupData[wk];
+        });
+        if(Object.keys(backupData).length>0){
+          _wpData=backupData;localStorage.setItem(wpKey,JSON.stringify(backupData));
+          console.warn('[WP] 从本地备份恢复了 '+Object.keys(backupData).length+' 周的数据');
+          if(typeof showToast==='function')showToast('🔄 从本地备份恢复了周计划数据');
+        }
+      }catch(e){}
     }
   }
+  // ★ j79 BUGFIX: tombstone 删除只在本地无内容时才执行
+  // 旧代码无条件删除任何有 tombstone 的周，即使该周刚被用户输入了新内容
+  // 这会导致：一旦某周被标记为"已删除"tombstone，后续所有操作都有名无实
+  try{
+    var deletedPrefix2='hwm_wp_deleted_'+_wpTargetUser()+'_';
+    Object.keys(_wpData).forEach(function(wk){
+      if(localStorage.getItem(deletedPrefix2+wk)==='1'||_wpIsForcedDeleted(_wpTargetUser(),wk)){
+        // ★ j79: 只在本地没有任何内容时才允许 tombstone 生效
+        var hasWork=!!(_wpData[wk]&&_wpData[wk].tasks&&_wpData[wk].tasks.some(function(t){return t.work&&t.work.trim();}));
+        if(!hasWork){
+          delete _wpData[wk];
+        } else {
+          // ★ 有内容的周不能死 — 清除错误的 tombstone
+          try{localStorage.removeItem(deletedPrefix2+wk);}catch(e){}
+          console.log('[J79 TOMBSTONE FIX] 清除 '+wk+' 的删除标记 — 该周有工作内容');
+        }
+      }
+    });
+    localStorage.setItem(wpKey,JSON.stringify(_wpData));
+  }catch(e){}
   // ② 后台从 Supabase 拉取并合并（跨设备数据同步，失败不影响使用）
-  var user=_wpViewingShared||_wpViewingSubordinate||_wpViewingDeptMember||(currentUser&&currentUser.name)||getCurrentEmployee().name;
-  if(!user||typeof user!=='string'||user.trim()===''){
+  // ★ j74: 冻结 user/key 在调用瞬间，防止异步回调时视图状态已变更
+  var frozenUser=_wpViewingShared||_wpViewingSubordinate||_wpViewingDeptMember||(currentUser&&currentUser.name)||getCurrentEmployee().name;
+  if(!frozenUser||typeof frozenUser!=='string'||frozenUser.trim()===''){
     console.warn('HWM: loadWPData aborted - user is empty');
     return;
   }
-  var currentKey=getWPLocalStorageKey();
+  var frozenKey=getWPLocalStorageKey();
   (async function(){
+    // ★ j74: 世代守卫 — 如果之后又触发了新的 loadWPData()，旧请求直接丢弃
+    if(_wpLoadGeneration!==gen)return;
     try{
       var seenNewer=false;
       // 分页拉取所有记录（最多200条/人）
@@ -353,31 +456,30 @@ function loadWPData(){
       while(!done){
         var resp=await supabase.from(SUPABASE_WP_TABLE)
           .select('week_id,plan_data',{count:'exact'})
-          .eq('username',user)
+          .eq('username',frozenUser)
           .range(from,to);
         if(resp.error){console.warn('HWM: WP Supabase load failed',resp.error.message);return;}
         if(resp.data)allRows=allRows.concat(resp.data);
         if(!resp.data||resp.data.length<1000)done=true;
         else from+=1000;to+=1000;
       }
-      // ★ V0.3.117: 云端数据为空 → 清空本地所有缓存（防止已删数据残留）
+      // ★ j74: 世代再检查 — Supabase 网络请求期间可能触发了新加载
+      if(_wpLoadGeneration!==gen)return;
+      // ★ j74: 云端返回空 → 不主动清空本地数据（可能是网络/RLS/用户名差异等临时问题）
+      // 原有 V0.3.117 逻辑过于激进：任何一次空返回都清空全部本地缓存，对人力资源负责人等高权限账号风险极大。
       if(allRows.length===0){
-        var localData=JSON.parse(localStorage.getItem(currentKey)||'{}');
-        if(Object.keys(localData).length>0){
-          localStorage.setItem(currentKey,'{}');
-          _wpData={};
-          try{if(_wpCurrent&&_wpCurrent.plan){_wpCurrent.plan=null;showWPEmpty();}}catch(e){}
-          try{var _y=_wpCurrent.year||new Date().getFullYear();var _m=_wpCurrent.month||(new Date().getMonth()+1);renderWPPlanList(_y,_m);}catch(e){}
-          console.log('[V0.3.117] Cloud empty — cleared all local cache for',user);
-        }
+        console.log('[V0.6.1.j74] Cloud returned 0 rows for '+frozenUser+' — keeping local data intact');
         return;
       }
       // 合并：云端最新版本覆盖本地旧版本
-      var localData=JSON.parse(localStorage.getItem(currentKey)||'{}');
+      var localData=JSON.parse(localStorage.getItem(frozenKey)||'{}');
       for(var i=0;i<allRows.length;i++){
         var row=allRows[i];
+        if(_wpIsForcedDeleted(frozenUser,row.week_id))continue;
         var cloudUpd=row.plan_data.updatedAt||'';
         var localUpd=(localData[row.week_id]&&localData[row.week_id].updatedAt)||'';
+        // 本地输入已落盘、云端确认尚未返回时，绝不接受旧云端快照覆盖。
+        if(_wpDirtyPlanVersions[row.week_id])continue;
         // ★ V0.6.1ge: 判断云端/本地是否有真实工作内容
         var cloudHasWork=!!(row.plan_data.tasks||[]).some(function(t){return t.work&&t.work.trim();});
         var localHasWork=!!(localData[row.week_id]&&(localData[row.week_id].tasks||[]).some(function(t){return t.work&&t.work.trim();}));
@@ -386,31 +488,75 @@ function loadWPData(){
         if(!localData[row.week_id]||cloudUpd>localUpd){
           localData[row.week_id]=row.plan_data;
           seenNewer=true;
+        }else if(_wpMergeCloudCollabStatuses(localData[row.week_id],row.plan_data)){
+          // 协同响应状态独立云端优先：不覆盖本地任务编辑，只刷新已接受/已拒绝徽章。
+          seenNewer=true;
         }
       }
-      // ★ V0.6.1ge: 云端已删除的周计划 → 本地同步删除（但有内容的本地数据绝不删除）
+      // ★ j74: 世代再检查 — 合并完成后再次验证
+      if(_wpLoadGeneration!==gen)return;
+      // ★ j77 关键修复：云端已删除的周计划 → 本地同步删除（但有内容/有更新的本地数据绝不删除）
+      // 旧版本会无脑删除所有不在云端的本地 week，导致用户刚输入的"测试测试"被云端空 W4 覆盖后丢失。
+      // 新版本：先保留所有 localData 中的 week（无论云端有没有），最后再选择性删除那些：
+      //   1. localStorage tombstone 标记存在（明确删除意图）
+      //   2. 云端存在但 localHasWork=false 且 cloudHasWork=false（双方都空）
+      //   3. 云端不存在但 localHasWork=false 且不在最近的 tombstone 备份中
       var cloudIds={};
-      for(var i=0;i<allRows.length;i++){cloudIds[allRows[i].week_id]=true;}
+      for(var i=0;i<allRows.length;i++){
+        if(!_wpIsForcedDeleted(frozenUser,allRows[i].week_id))cloudIds[allRows[i].week_id]=true;
+      }
       for(var wk in localData){
         if(!cloudIds[wk]){
-          var localHasContent=!!(localData[wk].tasks||[]).some(function(t){return t.work&&t.work.trim();});
-          if(localHasContent){console.log('[V0.6.1ge] 云端无双有内容本地数据，保护不删:',wk);continue;}
-          delete localData[wk];seenNewer=true;
-          console.log('[V0.3.117] Removed stale local cache for',wk);
+          // ★ j77: 仅在本地也明确无内容时删除（防止"刚保存的周计划被云端未同步删了"）
+          var wkHasContent=!!(localData[wk].tasks||[]).some(function(t){return t.work&&t.work&&t.work.trim();});
+          if(!wkHasContent){
+            // 进一步确认：如果是真正的空壳且有 tombstone 才删
+            delete localData[wk];seenNewer=true;
+            try{localStorage.setItem('hwm_wp_deleted_'+frozenUser+'_'+wk,'1');}catch(e){}
+            console.log('[V0.6.1.j77] Removed stale empty cache for',wk);
+          } else {
+            // ★ j77: 关键保护 — 本地有内容但云端不存在，**不要删除**！等用户后续 save 推上去。
+            console.log('[V0.6.1.j77] KEPT local plan with work: '+wk+' (cloud missing)');
+          }
         }
       }
-      // ★ V0.6.1.gi: 多重备份自动恢复 — 防御云端覆盖导致数据丢失
+      // ★ j77: 第二层防护 — 即使合并时被 cloud 覆盖，也要避免丢失本地 work
+      // 重新检查：cloudUpd 严格 > localUpd 才覆盖；相等时优先保留 local（防止时钟偏移导致数据回退）
+      try{
+        for(var i=0;i<allRows.length;i++){
+          var row=allRows[i];
+          if(_wpIsForcedDeleted(frozenUser,row.week_id))continue;
+          var ld=localData[row.week_id];
+          if(!ld)continue;
+          var localHasContent=!!(ld.tasks||[]).some(function(t){return t.work&&t.work&&t.work.trim();});
+          var cloudHasContent=!!(row.plan_data.tasks||[]).some(function(t){return t.work&&t.work&&t.work.trim();});
+          // 如果本地有 work 而云端没有，绝对不覆盖
+          if(localHasContent && !cloudHasContent){
+            // 已经是 continue 状态，无需操作
+            continue;
+          }
+          // 如果双方都有 work，且 cloudUpd 不严格大于 localUpd，不覆盖
+          if(localHasContent && cloudHasContent){
+            var cu=row.plan_data.updatedAt||'';
+            var lu=ld.updatedAt||'';
+            if(cu<=lu){
+              // 保留本地
+              console.log('[V0.6.1.j77] cloud not newer, keeping local for',row.week_id);
+            }
+          }
+        }
+      }catch(e){console.warn('[V0.6.1.j77] second-pass protection error',e.message);}
+      // ★ V0.6.1.gi/j52: 多重备份自动恢复，但尊重明确删除标记
       try{
         for(var wk in localData){
-          var hasContent=!!(localData[wk].tasks||[]).some(function(t){return t.work&&t.work.trim();});
-          if(!hasContent){
-            // 当前 localData 是空壳，尝试从 xxx_backup 恢复
-            var bkKey=currentKey+'_backup';
-            var bkRaw=localStorage.getItem(bkKey);
+          var hasContent=!!(localData[wk].tasks||[]).some(function(t){return t.work&&t.work&&t.work.trim();});
+          if(!hasContent && localStorage.getItem('hwm_wp_deleted_'+_wpTargetUser()+'_'+wk)!=='1'){
+            var bkKey=frozenKey+'_backup';
+            var bkRaw=localStorage.getItem(bkKey)||localStorage.getItem('__hwm_backup__'+frozenKey);
             if(bkRaw){
               try{
                 var bkData=JSON.parse(bkRaw);
-                if(bkData[wk]&&(bkData[wk].tasks||[]).some(function(t){return t.work&&t.work.trim();})){
+                if(bkData[wk]&&(bkData[wk].tasks||[]).some(function(t){return t.work&&t.work&&t.work.trim();})){
                   localData[wk]=bkData[wk];
                   console.log('[V0.6.1.gi] 备份恢复：'+wk);
                   seenNewer=true;
@@ -420,23 +566,92 @@ function loadWPData(){
           }
         }
       }catch(e){console.warn('[V0.6.1.gi] 备份恢复失败',e.message);}
-      // 写回 localStorage
-      try{localStorage.setItem(currentKey,JSON.stringify(localData));}catch(e){}
-      // 如果当前页面仍在查看同一用户，刷新显示
-      if(getWPLocalStorageKey()===currentKey){
+      // ★ j77: 第三层防护 — 如果 _wpCurrent.plan 引用了某个被合并覆盖的 plan，重新指向
+      if(getWPLocalStorageKey()===frozenKey){
+        // 检查 _wpCurrent.plan 是否仍然在合并后的 localData 中
+        if(_wpCurrent && _wpCurrent.plan && _wpCurrent.year){
+          var curId=makeWPId(_wpCurrent.year,_wpCurrent.month||(new Date().getMonth()+1),_wpCurrent.week);
+          if(localData[curId] && localData[curId]!==_wpCurrent.plan){
+            // 合并后数据与 _wpCurrent.plan 不一致 — 优先用合并后的（包含 latest cloud 状态）
+            _wpCurrent.plan=localData[curId];
+          }
+        }
         _wpData=localData;
-        try{if(_wpCurrent&&_wpCurrent.plan){renderWPTable(_wpCurrent.plan);}}catch(e){}
+        try{if(_wpCurrent&&_wpCurrent.plan){
+          var refreshed=getWP(_wpCurrent.year,_wpCurrent.month,_wpCurrent.week);
+          if(refreshed)_wpCurrent.plan=refreshed;
+          renderWPTable(_wpCurrent.plan);
+        }}catch(e){}
         try{var y=_wpCurrent.year||new Date().getFullYear();var m=_wpCurrent.month||(new Date().getMonth()+1);renderWPPlanList(y,m);}catch(e){}
         try{renderWPUserInfo();}catch(e){}
       }
     }catch(e){console.warn('HWM: WP Supabase sync error (non-critical)',e.message);}
   })();
+
+  // ★ V0.6.1.kb: 周计划页打开时启动云端轮询 — 解决发起方看不到接收方实时响应的问题
+  if(typeof _wpPollTimer==='undefined'||!_wpPollTimer){
+    _wpPollTimer=setInterval(function(){
+      if(typeof supabase==='undefined'||!supabase)return;
+      var curKey=getWPLocalStorageKey();
+      var user=curKey.replace(/^hwm_workplans_/,'');
+      if(!user)return;
+      (async function(){
+        try{
+          var resp=await supabase.from(SUPABASE_WP_TABLE)
+            .select('week_id,plan_data')
+            .eq('username',user);
+          if(resp.error||!resp.data||resp.data.length===0)return;
+          var currentKey=getWPLocalStorageKey();
+          var localData=JSON.parse(localStorage.getItem(currentKey)||'{}');
+          var seenNewer=false;
+          for(var i=0;i<resp.data.length;i++){
+            var row=resp.data[i];
+            if(_wpIsForcedDeleted(user,row.week_id))continue;
+            var cloudUpd=row.plan_data.updatedAt||'';
+            var localUpd=(localData[row.week_id]&&localData[row.week_id].updatedAt)||'';
+            // 输入后到云端确认前不允许轮询覆盖本地最新编辑。
+            if(_wpDirtyPlanVersions[row.week_id])continue;
+            var cloudHasWork=!!(row.plan_data.tasks||[]).some(function(t){return t.work&&t.work.trim();});
+            var localHasWork=!!(localData[row.week_id]&&(localData[row.week_id].tasks||[]).some(function(t){return t.work&&t.work.trim();}));
+            if(localHasWork&&!cloudHasWork)continue;
+            if(!localData[row.week_id]||cloudUpd>localUpd){
+              localData[row.week_id]=row.plan_data;
+              seenNewer=true;
+            }else if(_wpMergeCloudCollabStatuses(localData[row.week_id],row.plan_data)){
+              // 接收方响应只影响协同状态，强制以云端为准，不覆盖发起方尚未保存的任务编辑。
+              seenNewer=true;
+            }
+          }
+          if(seenNewer){
+            localStorage.setItem(currentKey,JSON.stringify(localData));
+            if(getWPLocalStorageKey()===currentKey){
+              _wpData=localData;
+              try{if(_wpCurrent&&_wpCurrent.plan){
+                var refreshed=getWP(_wpCurrent.year,_wpCurrent.month,_wpCurrent.week);
+                if(refreshed)_wpCurrent.plan=refreshed;
+                renderWPTable(_wpCurrent.plan);
+                showToast('🔄 周计划已从云端同步最新状态');
+              }}catch(e){}
+            }
+          }
+        }catch(e){/* 静默,不影响用户使用 */}
+      })();
+    },30000);
+    console.log('[WP Poll] 启动 30s 周期云端轮询');
+  }
 }
 
-function saveWPData(){
-  if(_wpViewingShared){console.log('[DEBUG saveWPData] SKIPPED - _wpViewingShared='+_wpViewingShared);return;}
+var _wpCloudSaveQueue=Promise.resolve();
+
+function saveWPData(onlyWeekId){
+  // ★ j78: onlyWeekId — 只保存指定的周计划到云端，不再批量保存全部100+条。
+  // 这消除了"保存时间窗口内 _wpData 被异步加载覆盖"的竞态条件。
+  // 例外：commitEditCell / saveWPAndGoHome 等关键路径不传 onlyWeekId 时会兜底全量保存
+
+  // ★ j74: 如果当前正在查看分享视图，拒绝保存
+  if(_wpViewingShared){console.log('[DEBUG saveWPData] SKIPPED - _wpViewingShared='+_wpViewingShared);return _wpCloudSaveQueue;}
   var key=getWPLocalStorageKey();
-  console.log('[DEBUG saveWPData] key='+key+' dataKeys='+Object.keys(_wpData).length);
+  console.log('[DEBUG saveWPData] key='+key+' dataKeys='+Object.keys(_wpData).length+' onlyWeekId='+(onlyWeekId||'(all)'));
   // ★ V0.6.1eh: 保存前先备份 — 防止数据丢失
   var oldData=localStorage.getItem(key);
   if(oldData){
@@ -444,27 +659,51 @@ function saveWPData(){
     try{localStorage.setItem('__hwm_backup__'+key,oldData);}catch(e){}
   }
   localStorage.setItem(key,JSON.stringify(_wpData));
+  // ★ j80: 保存成功后清除对应周的删除标记（防止之前错误设置的 tombstone 导致下次加载时删除）
+  try{
+    for(var wpId in _wpData){
+      var delKey='hwm_wp_deleted_'+_wpTargetUser()+'_'+wpId;
+      if(localStorage.getItem(delKey)==='1'){
+        var hasWork=_wpData[wpId]&&_wpData[wpId].tasks&&_wpData[wpId].tasks.some(function(t){return t.work&&t.work.trim();});
+        if(hasWork){localStorage.removeItem(delKey);console.log('[J80] 清除无效 tombstone: '+delKey);}
+      }
+    }
+  }catch(e){}
   // 异步推送到 Supabase（静默，失败不影响使用）
   // 检查 supabase 客户端是否已初始化
   if(typeof supabase==='undefined'||!supabase||!supabase.from){
     console.warn('HWM: WP Supabase not ready, skip cloud push');
-    return;
+    return _wpCloudSaveQueue;
   }
-  var user=_wpViewingSubordinate||_wpViewingDeptMember||(currentUser&&currentUser.name)||getCurrentEmployee().name;
+  // ★ j74: 冻结云端写入用户名在调用瞬间，而非在异步回调中重新读取全局状态
+  // 人力资源负责人经常切换下属视图，全局状态可能在异步执行前被 switchToMyWP() 清空
+  var frozenUser=_wpViewingSubordinate||_wpViewingDeptMember||(currentUser&&currentUser.name)||getCurrentEmployee().name;
   // 防御：user 为空时绝不能保存
-  if(!user||typeof user!=='string'||user.trim()===''){
+  if(!frozenUser||typeof frozenUser!=='string'||frozenUser.trim()===''){
     console.warn('HWM: saveWPData aborted - user is empty');
-    return;
+    return _wpCloudSaveQueue;
   }
-  var plans=JSON.parse(JSON.stringify(_wpData)); // 深拷贝避免引用问题
-  (async function(){
+  // ★ j74: 同时冻结当前计划引用 — 异步回调中的 _wpCurrent 可能已被 switchToMyWP() 置空
+  var frozenCurrent=_wpCurrent&&_wpCurrent.plan&&_wpCurrent.year?{year:_wpCurrent.year,month:_wpCurrent.month||(new Date().getMonth()+1),week:_wpCurrent.week||1,plan:_wpCurrent.plan}:null;
+  // ★ j78: 只深拷贝需要保存的周计划，而不是全部 _wpData
+  var plans={};
+  if(onlyWeekId && _wpData[onlyWeekId]){
+    plans[onlyWeekId]=JSON.parse(JSON.stringify(_wpData[onlyWeekId]));
+  } else if(!onlyWeekId){
+    // 兜底全量保存（来自 commitEditCell / submitWPPlan 等路径）
+    plans=JSON.parse(JSON.stringify(_wpData));
+  }
+  var dirtyVersions={};
+  for(var dirtyId in plans)dirtyVersions[dirtyId]=_wpDirtyPlanVersions[dirtyId]||plans[dirtyId].updatedAt||'';
+  _wpCloudSaveQueue=_wpCloudSaveQueue.catch(function(){}).then(async function(){
     try{
       // 使用 upsert 模式：只更新/插入当前保存的周计划，不影响其他周计划
       // 这样即使本地缓存不完整，也不会误删云端其他周的数据
       var rows=[], now=new Date().toISOString();
       for(var wpId in plans){
-        rows.push({username:user,week_id:wpId,plan_data:plans[wpId],updated_at:now});
+        rows.push({username:frozenUser,week_id:wpId,plan_data:plans[wpId],updated_at:now});
       }
+      var cloudSaveSucceeded=true;
       if(rows.length>0){
         var batchSize=50;
         for(var i=0;i<rows.length;i+=batchSize){
@@ -472,20 +711,24 @@ function saveWPData(){
           var r=await supabase.from(SUPABASE_WP_TABLE)
             .upsert(batch,{onConflict:'username,week_id'});
           if(r.error){
+            cloudSaveSucceeded=false;
             console.error('HWM: WP Supabase upsert batch',i,'failed',r.error.message);
             showToast('⚠️ 周计划云端同步失败: '+r.error.message);
           }
         }
       }
-      console.log('HWM: WP pushed to cloud,',rows.length,'plans for',user);
+      console.log('HWM: WP pushed to cloud,',rows.length,'plans for',frozenUser);
+      // 仅在云端成功确认且版本未变化时清除保护标记；网络失败必须继续保护本地草稿。
+      if(cloudSaveSucceeded){
+        for(var savedId in dirtyVersions){
+          if(_wpDirtyPlanVersions[savedId]===dirtyVersions[savedId])delete _wpDirtyPlanVersions[savedId];
+        }
+      }
       // 显示成功提示
       if(rows.length>0)showToast('☁️ 周计划已同步到云端 ✓');
-      // ★ 协同任务同步：发起方保存周计划时，自动同步协同任务到接收方
-      if(_wpCurrent&&_wpCurrent.plan&&_wpCurrent.year){
-        var cy=_wpCurrent.year;
-        var cm=_wpCurrent.month||(new Date().getMonth()+1);
-        var cw=_wpCurrent.week||1;
-        _syncCollabTasks(_wpCurrent.plan,user,cy,cm,cw).catch(function(e){
+      // ★ 协同任务同步：发起方保存周计划时，自动同步协同任务到接收方（使用冻结的计划引用）
+      if(frozenCurrent&&frozenCurrent.plan&&frozenCurrent.year){
+        _syncCollabTasks(frozenCurrent.plan,frozenUser,frozenCurrent.year,frozenCurrent.month,frozenCurrent.week).catch(function(e){
           console.warn('[Collab] syncCollabTasks failed',e.message);
         });
       }
@@ -493,7 +736,8 @@ function saveWPData(){
       console.error('HWM: WP Supabase save failed',e.message);
       showToast('⚠️ 云端同步失败: '+e.message,'warning');
     }
-  })();
+  });
+  return _wpCloudSaveQueue;
 }
 
 function makeWPId(y,m,w){
@@ -501,8 +745,84 @@ function makeWPId(y,m,w){
 }
 
 function getWP(y,m,w){return _wpData[makeWPId(y,m,w)]||null;}
-function saveWP(y,m,w,plan){var id=makeWPId(y,m,w);console.log('[DEBUG saveWP] id='+id+' planName='+(plan&&plan.name));_wpData[id]=plan;saveWPData();}
-function deleteWP(y,m,w){delete _wpData[makeWPId(y,m,w)];saveWPData();}
+function saveWP(y,m,w,plan){var id=makeWPId(y,m,w);console.log('[DEBUG saveWP] id='+id+' planName='+(plan&&plan.name)+' task0work="'+(plan&&plan.tasks&&plan.tasks[0]?plan.tasks[0].work.substr(0,20):'')+'"');_wpData[id]=plan;_wpDirtyPlanVersions[id]=(plan&&plan.updatedAt)||new Date().toISOString();return saveWPData(id);}
+
+// 任务编辑采用输入即持久化：不再依赖 blur 或顶部按钮。云端写入由 saveWPData 的串行队列保证顺序。
+function _wpPersistTaskInput(cell, value, syncCloud){
+  var p=_wpCurrent&&_wpCurrent.plan;
+  var field=cell&&cell.dataset&&cell.dataset.field;
+  if(!p||!field||field.indexOf('tasks.')!==0||_wpViewingShared){
+    // ★ j75 diagnostic: log early-exit reason
+    if(field&&field.indexOf('tasks.')===0) console.log('[WP-DIAG] _wpPersistTaskInput SKIP: p='+!!p+' field='+field+' viewingShared='+_wpViewingShared+' viewingSub='+_wpViewingSubordinate);
+    return;
+  }
+  var parts=field.split('.'), ti=parseInt(parts[1]), prop=parts[2];
+  if(isNaN(ti)||!prop||!p.tasks||!p.tasks[ti])return;
+  if(p.tasks[ti][prop]===value&&!syncCloud)return;
+  console.log('[WP-DIAG] _wpPersistTaskInput WRITE: '+field+' = "'+value.substr(0,30)+'" syncCloud='+syncCloud+' weekId='+makeWPId(p.year,p.month,p.week));
+  p.tasks[ti][prop]=value;
+  p.updatedAt=new Date().toISOString();
+  _calcWeekScore(p);
+  var id=makeWPId(p.year,p.month,p.week);
+  _wpData[id]=p;
+  _wpDirtyPlanVersions[id]=p.updatedAt;
+  // 每次输入立即写本地：关闭页面、点击表情或网络抖动都不会丢草稿。
+  try{localStorage.setItem(getWPLocalStorageKey(),JSON.stringify(_wpData));}catch(e){}
+  if(syncCloud)saveWP(p.year,p.month,p.week,p);
+}
+
+function _wpBindLiveTaskPersistence(cell, control){
+  if(!cell||!control||!cell.dataset||cell.dataset.field.indexOf('tasks.')!==0){
+    console.log('[WP-DIAG] _wpBindLiveTaskPersistence SKIP: cell='+!!cell+' dataset='+!!(cell&&cell.dataset)+' field='+(cell&&cell.dataset&&cell.dataset.field));
+    return;
+  }
+  console.log('[WP-DIAG] _wpBindLiveTaskPersistence BOUND: field='+cell.dataset.field+' currentUser='+(currentUser&&currentUser.name));
+  var timer=null;
+  control.addEventListener('input',function(){
+    _wpPersistTaskInput(cell,control.value,false);
+    clearTimeout(timer);
+    timer=setTimeout(function(){_wpPersistTaskInput(cell,control.value,true);},350);
+  });
+  control.addEventListener('change',function(){
+    clearTimeout(timer);
+    _wpPersistTaskInput(cell,control.value,true);
+  });
+}
+async function deleteWP(y,m,w,force){
+  var id=makeWPId(y,m,w), user=_wpTargetUser();
+  var sourceUid=(currentUser&&currentUser._uid)||user;
+  // 删除来源周计划前先撤回其协同请求；清理失败则中止删除，避免接收方遗留孤儿协同任务。
+  if(typeof supabase!=='undefined'&&supabase&&supabase.from){
+    try{await _clearCollabTasksFromSource(sourceUid,id);}
+    catch(e){console.error('[Collab] 删除周计划前清理协同任务失败:',e.message);if(typeof showToast==='function')showToast('⚠️ 协同任务清理失败，请重试');return false;}
+  }
+  // 先删除云端；云端失败时保留本地，避免两端状态不一致
+  if(typeof supabase!=='undefined'&&supabase&&supabase.from){
+    try{await _wpDeleteCloudPlan(user,id);}
+    catch(e){console.error('[WP] 云端删除失败:',e.message);if(typeof showToast==='function')showToast('⚠️ 云端删除失败，请重试');return false;}
+  }
+  delete _wpData[id];
+  try{localStorage.setItem('hwm_wp_deleted_'+user+'_'+id,'1');}catch(e){}
+  try{localStorage.setItem(getWPLocalStorageKey(),JSON.stringify(_wpData));}catch(e){}
+  _wpRemoveBackups(getWPLocalStorageKey());
+  return true;
+}
+
+async function forceDeleteViewedWP(){
+  if(!_wpCanForceDelete()){_showAlert('只有管理员可以强制删除员工周计划','⚠️ 无权操作',true);return;}
+  var p=_wpCurrent&&_wpCurrent.plan;
+  if(!p){_showAlert('请先选择要删除的周计划');return;}
+  var user=_wpTargetUser(), y=p.year, m=p.month, w=p.week;
+  var ok=await _showConfirm('确定强制删除 '+user+' 的 '+y+'年'+m+'月第'+w+'周全部周计划吗？\\n\\n将同时删除云端、本地缓存和备份，删除后不可恢复。','管理员强制删除');
+  if(!ok)return;
+  var deleted=await deleteWP(y,m,w,true);
+  if(!deleted)return;
+  _wpCurrent={year:null,month:null,week:null,plan:null};
+  showWPEmpty();
+  renderWPPlanList(y,m);
+  renderWPUserInfo();
+  if(typeof showToast==='function')showToast('已强制删除 '+user+' 第'+w+'周全部周计划');
+}
 
 function _getPrevWeek(y,m,w){
   // 计算上一周的 (year, month, week)
@@ -1502,13 +1822,8 @@ function renderWPPlanList(year,month){
     var plan=getWP(year,month,w);
     var active=(_wpCurrent&&_wpCurrent.year===year&&_wpCurrent.month===month&&_wpCurrent.week===w);
     var taskCount=plan?plan.tasks.filter(function(t){return t.work;}).length:0;
-    var delBtn='';
-    if(plan){
-      var myName2=(currentUser&&currentUser.name)||'';
-      var isLocked2=plan.firstSubmittedAt||plan.summarySubmittedAt||(plan.frozen&&plan.frozenBy&&plan.frozenBy!==myName2)||plan.bossEvaluated;
-      delBtn='<span class="wp-sidebar-plan-delete'+(isLocked2?' locked':'')+'"'+(isLocked2?' title="如要删除本周行动项请先解除上级锁定或撤回提交周小结及周计划"':'')+' onclick="event.stopPropagation();delWPFromSidebar('+year+','+month+','+w+')">×</span>';
-    }
-    html+='<div class="wp-sidebar-plan-item'+(active?' active':'')+'" onclick="selectWP('+year+','+month+','+w+')">'+delBtn+'<div class="week-label">'+weekLabels[w-1]+'</div><div class="task-count">('+taskCount+')</div></div>';
+    // 删除入口统一收敛至周行动项页面工具栏，导航仅负责周次切换。
+    html+='<div class="wp-sidebar-plan-item'+(active?' active':'')+'" onclick="selectWP('+year+','+month+','+w+')"><div class="week-label">'+weekLabels[w-1]+'</div><div class="task-count">('+taskCount+')</div></div>';
   }
   list.innerHTML=html;
   // ★ V0.4.91s: 同步渲染全年周度导航网格
@@ -1656,6 +1971,7 @@ function selectWP(y,m,w){
     if(correctName && plan.name !== correctName){ plan.name = correctName; dirty=true; }
     if(correctDept && plan.dept !== correctDept){ plan.dept = correctDept; dirty=true; }
     if(correctPos && plan.position !== correctPos){ plan.position = correctPos; dirty=true; }
+    if(_clearProblemPlaceholderData(plan))dirty=true;
     // ★ V0.1.59: 确保至少1行（旧数据可能只有0行）
     while(plan.tasks.length<1){
       plan.tasks.push({seq:plan.tasks.length+1,work:'',goal:'',startDate:'',plannedDate:'',actualDate:'',estimatedHours:'',status:'',supporters:'',problems:'',problemType:'',needBoss:'',bossFeedback:'',aiSuggestion:''});
@@ -1775,9 +2091,19 @@ function _renderCollabTasksSection(plan){
   var collabTasks=[];
   if(plan&&plan.collab_tasks&&Array.isArray(plan.collab_tasks)){
     collabTasks=plan.collab_tasks;
-    // ★ V0.5.25: 过滤掉来自自己的协同任务
-    var myName=(currentUser&&currentUser.name)||'';
-    collabTasks=collabTasks.filter(function(ct){return ct&&ct.collab_from!==myName;});
+    // ★ V0.6.1.ka: 过滤掉来自自己的协同任务 — 同时匹配 name + _uid + case-insensitive
+    var myName=((currentUser&&currentUser.name)||'').toString().trim().toLowerCase();
+    var myUid=((currentUser&&currentUser._uid)||'').toString().trim().toLowerCase();
+    collabTasks=collabTasks.filter(function(ct){
+      if(!ct)return false;
+      var cfName=(ct.collab_from||'').toString().trim().toLowerCase();
+      var cfUid=(ct.collab_from_uid||'').toString().trim().toLowerCase();
+      // 排除: 协同人=自己(name 或 uid 任一匹配), 或没有 collab_from 字段(脏数据)
+      if(!cfName&&!cfUid)return false;
+      if(cfName&&cfName===myName)return false;
+      if(cfUid&&cfUid===myUid)return false;
+      return true;
+    });
     // ★ V0.1.34: 按 collab_from+work 内容去重
     var seen={};
     collabTasks=collabTasks.filter(function(ct){
@@ -1852,6 +2178,36 @@ function _renderCollabTasksSection(plan){
 
 // ===== 协同任务系统（第2步：发起方写入 + 接收方读取）=====
 
+// ★ V0.6.1.j84: 通用占位符文字清洗 — 仅清洗"协同人"chip 编辑器污染的 UI 文字
+// 之前 j83 包含"无"导致误伤真实数据（如"无资源"→"资源"），已撤掉
+var WP_PLACEHOLDER_TEXT = /协同人|⏳|待响应|已接受|已拒绝|✅|❌/gi;
+function _cleanPlaceholderText(val){
+  if(!val)return '';
+  return String(val).replace(WP_PLACEHOLDER_TEXT,'').replace(/^[,，;；、\s]+|[,，;；、\s]+$/g,'').trim();
+}
+
+// “填写”是问题列的默认提示，不是用户输入。仅精确匹配时才清空，避免误伤真实内容。
+function _normalizeProblemPlaceholder(val){
+  return typeof val==='string'&&val.trim()==='填写'?'':val;
+}
+function _clearProblemPlaceholderData(plan){
+  if(!plan||!Array.isArray(plan.tasks))return false;
+  var changed=false;
+  for(var i=0;i<plan.tasks.length;i++){
+    var task=plan.tasks[i];
+    if(task&&typeof task.problems==='string'&&task.problems.trim()==='填写'){
+      task.problems='';
+      changed=true;
+    }
+    var fieldKey='tasks.'+i+'.problems';
+    if(plan._revisions&&plan._revisions[fieldKey]&&typeof plan._revisions[fieldKey].value==='string'&&plan._revisions[fieldKey].value.trim()==='填写'){
+      delete plan._revisions[fieldKey];
+      changed=true;
+    }
+  }
+  return changed;
+}
+
 // 解析 supporters 字符串为结构化数组 [{uid,name,dept,status}]
 function _parseSupporters(s){
   if(!s)return [];
@@ -1877,9 +2233,11 @@ function _renderSupportersCell(plan,taskIndex,rawSupporters){
   if(plan._revisions&&plan._revisions[fieldKey]&&plan._revisions[fieldKey].value){
     displayVal=plan._revisions[fieldKey].value;
   }
-  if(!displayVal)return '<span style="color:var(--text-hint)">填写</span>';
+  // ★ j83: 使用通用清洗函数，去除历史脏数据中保存的占位符文字
+  displayVal=_cleanPlaceholderText(displayVal);
+  if(!displayVal)return '<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">协同人</span>';
   var sups=_parseSupporters(displayVal);
-  if(sups.length===0)return '<span style="color:var(--text-hint)">填写</span>';
+  if(sups.length===0)return '<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">协同人</span>';
   // 检查是否有协同状态信息
   var hasStatuses=plan._collab_statuses&&Object.keys(plan._collab_statuses).length>0;
   // ★ V0.6.1cf: 修订红色文字已取消
@@ -2064,42 +2422,27 @@ async function _syncCollabTasks(plan,fromName,year,month,week){
     }
   }
 
-  // ★ 清理已撤回的协同任务（发起方删除了协同人后，接收方对应的任务也要删除）
-  for(var i2=0;i2<plan.tasks.length;i2++){
-    var t2=plan.tasks[i2];
-    if(!t2.supporters)continue;
-    var sups2=_parseSupporters(t2.supporters);
-    for(var j2=0;j2<sups2.length;j2++){
-      var s2=sups2[j2];
-      if(!s2.uid||s2.uid===fromUid)continue;
-      try{
-        var resp2=await supabase.from(SUPABASE_WP_TABLE)
-          .select('username,plan_data')
-          .eq('username',s2.uid)
-          .eq('week_id',weekId)
-          .limit(1);
-        if(!resp2.data||resp2.data.length===0)continue;
-        // ★ 验证 username 匹配
-        if(resp2.data[0].username!==s2.uid)continue;
-        var rp=resp2.data[0].plan_data;
-        if(!rp||!rp.collab_tasks)continue;
-        var removed=false;
-        for(var k2=rp.collab_tasks.length-1;k2>=0;k2--){
-          var ct=rp.collab_tasks[k2];
-          // 只清理来自当前发起方的、且不在 activeReqIds 中的协同任务
-          if(ct.collab_from_uid===fromUid&&ct.collab_req_id&&!activeReqIds[ct.collab_req_id]){
-            rp.collab_tasks.splice(k2,1);
-            removed=true;
-            console.log('[Collab] 清理已撤回的协同任务: '+ct.collab_req_id);
-          }
-        }
-        if(removed){
-          rp.updatedAt=new Date().toISOString();
-          await supabase.from(SUPABASE_WP_TABLE)
-            .upsert([{username:s2.uid,week_id:weekId,plan_data:rp,updated_at:new Date().toISOString()}],{onConflict:'username,week_id'});
-        }
-      }catch(e){}
+  // 清理已撤回的协同任务：扫描本周所有接收计划，而非只扫描当前仍在 supporters 里的员工。
+  // 否则 A 删除 B 这个协同人后，B 不再出现在当前名单中，旧协同任务就永远无法被清理。
+  try{
+    var cleanupResp=await supabase.from(SUPABASE_WP_TABLE).select('username,plan_data').eq('week_id',weekId);
+    if(cleanupResp.error)throw cleanupResp.error;
+    for(var i2=0;i2<(cleanupResp.data||[]).length;i2++){
+      var cleanupRow=cleanupResp.data[i2], rp=cleanupRow.plan_data;
+      if(!rp||!Array.isArray(rp.collab_tasks))continue;
+      var beforeCount=rp.collab_tasks.length;
+      rp.collab_tasks=rp.collab_tasks.filter(function(ct){
+        return !(ct&&ct.collab_from_uid===fromUid&&ct.collab_req_id&&!activeReqIds[ct.collab_req_id]);
+      });
+      if(rp.collab_tasks.length===beforeCount)continue;
+      rp.updatedAt=new Date().toISOString();
+      var cleanupSave=await supabase.from(SUPABASE_WP_TABLE)
+        .upsert([{username:cleanupRow.username,week_id:weekId,plan_data:rp,updated_at:rp.updatedAt}],{onConflict:'username,week_id'});
+      if(cleanupSave.error)throw cleanupSave.error;
+      console.log('[Collab] 已清理 '+(beforeCount-rp.collab_tasks.length)+' 条撤回协同任务，接收方='+cleanupRow.username);
     }
+  }catch(e){
+    console.warn('[Collab] 清理撤回协同任务失败:',e.message);
   }
   // ★ 初始化发起方自己的 _collab_statuses（在 Supabase 中），供接收方响应时回写
   try{
@@ -2158,23 +2501,37 @@ async function _collabRespond(btn){
   if(parts.length<3)return;
   var fromUid=parts[0];
   var reqId=parts[1];
-  var taskIdx=parseInt(parts[2]);
   var newStatus=btn.getAttribute('data-status')||'pending';
 
-  if(!_wpCurrent||!_wpCurrent.plan||!_wpCurrent.plan.collab_tasks){
-    showToast('⚠️ 未找到协同任务数据');
+  if(!_wpCurrent||!_wpCurrent.plan){
+    showToast('⚠️ 未找到周计划数据,请稍后再试');
     return;
   }
-  var ct=_wpCurrent.plan.collab_tasks[taskIdx];
-  if(!ct||ct.collab_req_id!==reqId){
-    showToast('⚠️ 协同任务不匹配');
+  if(!_wpCurrent.plan.collab_tasks||!Array.isArray(_wpCurrent.plan.collab_tasks)){
+    // ★ 极端边界:collab_tasks 数组被破坏时尝试初始化
+    _wpCurrent.plan.collab_tasks=[];
+  }
+  // ★ V0.6.1.kc: 用 reqId 查找任务,不再依赖 index(防多设备同步后数组顺序变化导致点不到)
+  var ct=null;
+  var realIdx=-1;
+  for(var k=0;k<_wpCurrent.plan.collab_tasks.length;k++){
+    if(_wpCurrent.plan.collab_tasks[k]&&_wpCurrent.plan.collab_tasks[k].collab_req_id===reqId){
+      ct=_wpCurrent.plan.collab_tasks[k];
+      realIdx=k;
+      break;
+    }
+  }
+  if(!ct){
+    showToast('⚠️ 协同任务不匹配(reqId='+reqId+'),已尝试重新加载...');
+    // ★ 自愈:数据被外部清空,主动拉云端最新
+    setTimeout(function(){try{loadWPData();}catch(e){}},500);
     return;
   }
   // 更新本地状态
   ct.status=newStatus;
-  _wpCurrent.plan.collab_tasks[taskIdx]=ct;
+  _wpCurrent.plan.collab_tasks[realIdx]=ct;
   // 保存到 localStorage
-  saveWPData();
+  try{saveWPData();}catch(e){console.warn('[Collab] saveWPData failed',e);}
   // 刷新表格（协同区域会重新渲染）
   renderWPTable(_wpCurrent.plan);
   // 提示
@@ -2478,15 +2835,83 @@ async function clearTaskRow(idx){
   showToast('✨ 已清空第 '+(idx+1)+' 行所有内容');
 }
 
+// 在任务表原表头离开可视区后显示克隆表头，避免纵向浏览时丢失字段语义。
+function _bindWPStickyTableHeader(content){
+  if(!content)return;
+  if(content._wpStickyHeaderCleanup)content._wpStickyHeaderCleanup();
+  var old=document.getElementById('wpStickyTableHeader');
+  if(old)old.remove();
+  var pageScroll=content.querySelector('.wp-page-scroll');
+  var tableScroll=content.querySelector('.wp-table-x-scroll');
+  var sourceTable=tableScroll&&tableScroll.querySelector('.wp-table');
+  var sourceHead=sourceTable&&sourceTable.querySelector('thead');
+  if(!pageScroll||!tableScroll||!sourceTable||!sourceHead)return;
+
+  var sticky=document.createElement('div');
+  sticky.id='wpStickyTableHeader';
+  sticky.className='wp-sticky-table-header';
+  sticky.setAttribute('aria-hidden','true');
+  sticky.innerHTML='<div class="wp-table-wrap"><table class="wp-table">'+(sourceTable.querySelector('colgroup')?sourceTable.querySelector('colgroup').outerHTML:'')+'<thead>'+sourceHead.innerHTML+'</thead></table></div>';
+  content.appendChild(sticky);
+
+  var sourceCells=sourceHead.querySelectorAll('th');
+  var stickyCells=sticky.querySelectorAll('th');
+  for(var i=0;i<sourceCells.length&&i<stickyCells.length;i++){
+    var w=Math.ceil(sourceCells[i].getBoundingClientRect().width);
+    stickyCells[i].style.width=w+'px';
+    stickyCells[i].style.minWidth=w+'px';
+    stickyCells[i].style.maxWidth=w+'px';
+  }
+
+  var ticking=false;
+  function sync(){
+    ticking=false;
+    var topbar=document.querySelector('.wp-topbar');
+    var topbarRect=topbar?topbar.getBoundingClientRect():null;
+    var fixedTop=topbarRect?Math.round(topbarRect.bottom):0;
+    var tableRect=tableScroll.getBoundingClientRect();
+    var headRect=sourceHead.getBoundingClientRect();
+    var canStick=headRect.top<=fixedTop && tableRect.bottom>fixedTop+headRect.height;
+    if(canStick){
+      sticky.style.left=Math.round(tableRect.left)+'px';
+      sticky.style.top=fixedTop+'px';
+      sticky.style.width=Math.round(tableRect.width)+'px';
+      sticky.style.height=Math.ceil(headRect.height)+'px';
+      sticky.classList.add('is-visible');
+      if(Math.abs(sticky.scrollLeft-tableScroll.scrollLeft)>1)sticky.scrollLeft=tableScroll.scrollLeft;
+    }else{
+      sticky.classList.remove('is-visible');
+    }
+  }
+  function requestSync(){if(!ticking){ticking=true;requestAnimationFrame(sync);}}
+  function onTableScroll(){
+    if(sticky.scrollLeft!==tableScroll.scrollLeft)sticky.scrollLeft=tableScroll.scrollLeft;
+    requestSync();
+  }
+  pageScroll.addEventListener('scroll',requestSync,{passive:true});
+  tableScroll.addEventListener('scroll',onTableScroll,{passive:true});
+  window.addEventListener('resize',requestSync,{passive:true});
+  content._wpStickyHeaderCleanup=function(){
+    pageScroll.removeEventListener('scroll',requestSync);
+    tableScroll.removeEventListener('scroll',onTableScroll);
+    window.removeEventListener('resize',requestSync);
+    content._wpStickyHeaderCleanup=null;
+  };
+  requestSync();
+}
+
 function renderWPTable(plan){
   if(!plan)return;
   var content=document.getElementById('wpContent');
   if(!content)return;
-  // ★ V0.5.190: 真正的滚动容器是 .wp-scroll-area（overflow:auto），不是 document.scrollingElement!
-  var _oldScroll=content.querySelector('.wp-scroll-area');
-  var _savedScrollTop=_oldScroll?_oldScroll.scrollTop:0;
-  var _savedScrollLeft=_oldScroll?_oldScroll.scrollLeft:0;
+  // 页面纵向滚动与表格横向滚动分离，避免用 JS transform 补偿造成顶部区域抖动。
+  var _oldPageScroll=content.querySelector('.wp-page-scroll');
+  var _oldTableScroll=content.querySelector('.wp-table-x-scroll');
+  var _savedScrollTop=_oldPageScroll?_oldPageScroll.scrollTop:0;
+  var _savedScrollLeft=_oldTableScroll?_oldTableScroll.scrollLeft:0;
   var dd=document.getElementById('wpDefault');
+  var oldPage=content.querySelector('.wp-page-scroll');
+  if(oldPage)oldPage.remove();
   var tb=content.querySelector('#wpToolbar');
   var ta=content.querySelector('.wp-table-area');
   var ib=content.querySelector('.wp-info-bar');
@@ -2503,7 +2928,7 @@ function renderWPTable(plan){
   if(!plan.year||!plan.month||!plan.week){console.warn('renderWPTable: plan missing year/month/week',plan);return;}
     var weekLabel=plan.year+'年'+plan.month+'月 第'+plan.week+'周';
   var html='';
-  html+='<div class="wp-scroll-area">';
+  html+='<div class="wp-page-scroll">';
 
   html+='<div class="wp-info-bar"><strong>当前员工：</strong><strong>'+_h(plan.name)+'</strong>&nbsp;'+_h(plan.dept)+' | '+_h(plan.position)+'<span class="sep">|</span>'+weekLabel;
   if(_wpViewingSubordinate)html+='<span style="color:#E8622A;font-weight:500;margin-left:8px">（查看直属下属周计划）</span>';
@@ -2517,7 +2942,7 @@ function renderWPTable(plan){
   if(plan.bossEvaluated)html+='<span style="color:#059669;margin-left:8px">✓ 上级已评价</span>';
   html+='</div>';
 
-  html+='<div class="wp-toolbar" id="wpToolbar" style="display:flex;flex-wrap:wrap;gap:16px;padding:10px 0;margin-bottom:7px;border-bottom:1px solid var(--border)">';
+  html+='<div class="wp-toolbar" id="wpToolbar" style="display:flex;flex-wrap:wrap;gap:8px;padding:8px 0;margin-bottom:4px;border-bottom:1px solid var(--border)">';
   if(_wpViewingShared){
     // ★ V0.5.79b: 只读模式 — 被授权查看他人周计划
     html+='<span style="color:#3B7DB4;font-weight:600">📖 只读模式 — 您正在查看 '+esc(_wpViewingShared)+' 分享的周计划</span>';
@@ -2585,11 +3010,13 @@ function renderWPTable(plan){
     }else{
       html+='<button class="wp-btn-delete" onclick="deleteCurrentWPPlan()"><span>🗑</span> 删除周行动项</button>';
     }
-    html+='<button class="wp-btn-export" onclick="exportCurrentWP()"><span>📥</span> 导出周行动项</button>';
-    if(plan.bossEvaluated){
+  // ★ j81: 工具操作前加分隔线 — 视觉分组（工作流 / 工具）
+  html+='<span class="wp-toolbar-divider" aria-hidden="true"></span>';
+  html+='<button class="wp-btn-export" onclick="exportCurrentWP()" title="导出周行动项"><span>📥</span> 导出</button>';
+  if(plan.bossEvaluated){
       html+='<button onclick="viewBossEval()"><span style="color:#2A476A">📋</span> 查看上级评价</button>';
     }
-    html+='<button class="wp-btn-ai" onclick="aiAssessWP()" style="margin-left:auto"><span style="line-height:1.5"><span style="font-size:16px;font-weight:700">AI</span><br>分析建议</span></button>';
+    html+='<button id="wpAiAssessBtn" class="wp-btn-ai" onclick="aiAssessWP()" style="margin-left:auto" title="生成本周 AI 建议"><span style="font-size:14px;font-weight:700">AI</span><span>建议</span></button>';
   }
   // 安全兜底：确保工具栏至少有一个可见按钮（防止所有分支都未命中导致空白）
   if(html.indexOf('<button', html.lastIndexOf('wpToolbar')) < 0){
@@ -2597,44 +3024,27 @@ function renderWPTable(plan){
   }
   html+='</div>';
 
-  // ★ V0.1.35: 时间管理规则面板
+  // 填写参考默认收纳，避免规则与统计信息抢占任务首屏。
   html+=_renderTimeManagementPanel(plan);
 
-  var completed=0,progress=0,hasPlan=0,hasActual=0,overdue=0;
+  // 任务表合计行仍需使用这些统计值；不再渲染独立状态摘要栏。
+  var hasPlan=0,hasActual=0,overdue=0;
   var todayStr=_getTodayStr();
   for(var i=0;i<plan.tasks.length;i++){
-    var t=plan.tasks[i];
-    if(t.status==='✓完成'||t.status==='按时完成')completed++;
-    else if(t.status==='⚙推进中'||t.status==='进行中')progress++;
-    var pd=t.plannedDate||'';
-    if(pd){ hasPlan++; if(pd<todayStr&&t.status!=='✓完成'&&t.status!=='按时完成')overdue++; }
-    var ad=t.actualDate||'';
-    if(ad)hasActual++;
+    var summaryTask=plan.tasks[i]||{};
+    var plannedDate=summaryTask.plannedDate||'';
+    if(plannedDate){
+      hasPlan++;
+      if(plannedDate<todayStr&&summaryTask.status!=='✓完成'&&summaryTask.status!=='按时完成')overdue++;
+    }
+    if(summaryTask.actualDate)hasActual++;
   }
-  // ★ V0.1.49: 任务得分合计
-  var _taskTotal=0;if(plan._taskScores){for(var tsi=0;tsi<plan._taskScores.length;tsi++)_taskTotal+=plan._taskScores[tsi]||0;}
-  var taskScoreDisplay='';if(_taskTotal!==0||plan.bossEvaluated){taskScoreDisplay=(_taskTotal>0?'+':'')+_taskTotal;}
-
-  html+='<div class="wp-summary-bar">';
-  html+='<div class="wp-summary-item"><span class="wp-summary-label">✅ 完成：</span><span class="wp-summary-value">'+completed+'</span></div>';
-  html+='<div class="wp-summary-item"><span class="wp-summary-label">⚙ 推进：</span><span class="wp-summary-value">'+progress+'</span></div>';
-  html+='<div class="wp-summary-item"><span class="wp-summary-label">📅 已排期：</span><span class="wp-summary-value">'+hasPlan+'</span></div>';
-  html+='<div class="wp-summary-item"><span class="wp-summary-label">🏁 已完成：</span><span class="wp-summary-value">'+hasActual+'</span></div>';
-  html+='<div class="wp-summary-item"><span class="wp-summary-label">⚠️ 逾期：</span><span class="wp-summary-value" style="color:'+(overdue>0?'var(--danger)':'var(--success)')+'">'+overdue+'</span></div>';
-  // ★ V0.1.49: 任务完成积分
-  if(_taskTotal!==0||plan.bossEvaluated){
-    var tsColor='#2A476A';
-    var tsSign=_taskTotal>0?'+':'';
-    html+='<div class="wp-summary-item"><span class="wp-summary-label">📊 任务积分：</span><span class="wp-summary-value" style="color:'+tsColor+'">'+tsSign+_taskTotal+'</span></div>';
+  var _taskTotal=0;
+  if(plan._taskScores){
+    for(var tsi=0;tsi<plan._taskScores.length;tsi++)_taskTotal+=plan._taskScores[tsi]||0;
   }
-  // ★ V0.6.1.hh: 上级评级显示
-  var ratingRead=plan.weeklyRating||'';
-  if(ratingRead){
-    var ratingMap={gold:{emoji:'🥇',label:'金牌',val:'+2'},silver:{emoji:'🥈',label:'银牌',val:'+1'},bronze:{emoji:'🥉',label:'铜牌',val:'0'},warn:{emoji:'⚠️',label:'待改',val:'-1'},danger:{emoji:'⛔',label:'严重',val:'-2'}};
-    var rd=ratingMap[ratingRead];
-    if(rd) html+='<div class="wp-summary-item"><span class="wp-summary-label">🏅 评级：</span><span class="wp-summary-value">'+rd.emoji+' '+rd.label+' '+rd.val+'</span></div>';
-  }
-  html+='</div>';
+  var taskScoreDisplay='';
+  if(_taskTotal!==0||plan.bossEvaluated)taskScoreDisplay=(_taskTotal>0?'+':'')+_taskTotal;
 
   // ★ V0.6.1cd: 表头双击排序 — 临时替换plan.tasks为排序副本
   var _wpOrigTasks=null;
@@ -2650,7 +3060,7 @@ function renderWPTable(plan){
     else newTasks.push(j);
   }
 
-  html+='<div class="wp-table-area"><div class="wp-table-wrap"><table class="wp-table"><colgroup><col style="width:56px"><col style="width:180px"><col style="width:80px"><col style="width:115px"><col style="width:115px"><col style="width:80px"><col style="width:115px"><col style="width:56px"><col style="width:90px"><col style="width:48px"><col style="width:80px"><col style="width:150px"><col style="width:90px"><col style="width:56px"><col style="width:150px"><col style="width:150px"></colgroup><thead><tr>';
+  html+='<div class="wp-table-x-scroll"><div class="wp-table-area"><div class="wp-table-wrap"><table class="wp-table"><colgroup><col style="width:56px"><col style="width:180px"><col style="width:80px"><col style="width:115px"><col style="width:115px"><col style="width:80px"><col style="width:115px"><col style="width:56px"><col style="width:90px"><col style="width:48px"><col style="width:80px"><col style="width:150px"><col style="width:90px"><col style="width:56px"><col style="width:150px"><col style="width:150px"></colgroup><thead><tr>';
   var _sPri='',_sSd='',_sPd='',_sRd='',_sAd='',_sSt='';
   if(_wpSort && _wpSort.col && _wpSort.dir){
     var _arr=_wpSort.dir==='asc'?' ↑':' ↓';
@@ -2683,18 +3093,18 @@ function renderWPTable(plan){
       html+='<tr style="background:#FFFDF5" data-task-idx="'+jj+'">';
       // ★ V0.1.59: 上周转入的不可删除，只显示序号
       html+='<td class="col-num" style="text-align:center;color:#8B6914">'+seq+'</td>';
-      html+='<td class="'+edCls+' col-work" data-field="tasks.'+jj+'.work" data-type="textarea"'+edClick+'>'+(tt.work?_hWork(tt.work):'<span style="color:var(--text-hint)">点击填写</span>')+cfTag+'</td>';
+      html+='<td class="'+edCls+' col-work" data-field="tasks.'+jj+'.work" data-type="textarea"'+edClick+'>'+(tt.work?_hWork(tt.work):'<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">点击填写</span>')+cfTag+'</td>';
       var __goalRaw=tt.goal||'';
       var __goalVal=renderWPCellValue(plan,'tasks.'+jj+'.goal',tt.goal);
       var __goalPriClass=__goalRaw==='重要紧急'?'pri-urgent':__goalRaw==='重要不急'?'pri-important':__goalRaw==='日常紧急'?'pri-daily-urgent':__goalRaw==='日常事项'?'pri-daily-routine':'';
-      html+='<td class="'+edCls+' col-goal '+__goalPriClass+'" data-field="tasks.'+jj+'.goal" data-type="select" data-opts="'+WP_GOAL_OPTIONS.join(',')+'"'+edClick+'>'+(__goalVal||'<span style="color:var(--text-hint)">选择</span>')+'</td>';
+      html+='<td class="'+edCls+' col-goal '+__goalPriClass+'" data-field="tasks.'+jj+'.goal" data-type="select" data-opts="'+WP_GOAL_OPTIONS.join(',')+'"'+edClick+'>'+(__goalVal||'<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">选择</span>')+'</td>';
       var _sd=renderWPCellValue(plan,'tasks.'+jj+'.startDate',tt.startDate||'');
-      html+='<td class="'+edCls+' col-hours" data-field="tasks.'+jj+'.startDate" data-type="date"'+edClick+'>'+(_sd?_sd:'<span style="color:var(--text-hint)">点击选择日期</span>')+'</td>';
+      html+='<td class="'+edCls+' col-hours" data-field="tasks.'+jj+'.startDate" data-type="date"'+edClick+'>'+(_sd?_sd:'<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">点击选择日期</span>')+'</td>';
       var _pd=renderWPCellValue(plan,'tasks.'+jj+'.plannedDate',tt.plannedDate||'');
-      html+='<td class="'+edCls+' col-hours" data-field="tasks.'+jj+'.plannedDate" data-type="date"'+edClick+'>'+(_pd?_pd:'<span style="color:var(--text-hint)">点击选择日期</span>')+'</td>';
+      html+='<td class="'+edCls+' col-hours" data-field="tasks.'+jj+'.plannedDate" data-type="date"'+edClick+'>'+(_pd?_pd:'<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">点击选择日期</span>')+'</td>';
       html+='<td class="col-remaining" style="text-align:center;font-size:12px">'+_calcRemainingDays(tt.plannedDate||'',tt.actualDate||'')+'</td>';
       var _ad=renderWPCellValue(plan,'tasks.'+jj+'.actualDate',tt.actualDate||'');
-      html+='<td class="'+edCls+' col-hours" data-field="tasks.'+jj+'.actualDate" data-type="date"'+edClick+'>'+(_ad?_ad:'<span style="color:var(--text-hint)">点击选择日期</span>')+'</td>';
+      html+='<td class="'+edCls+' col-hours" data-field="tasks.'+jj+'.actualDate" data-type="date"'+edClick+'>'+(_ad?_ad:'<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">点击选择日期</span>')+'</td>';
       // ★ V0.4.91d/Q: 耗时列（自动计算，只读）+ 蓝色角标 + tooltip数据
       var _dur=_calcTaskDuration(tt);
       var _durTip='';
@@ -2706,16 +3116,21 @@ function renderWPTable(plan){
       }
       html+='<td class="col-duration' + (_dur?' has-duration':'') + '"' + (_durTip?' data-dur-tip="'+_durTip+'"':'') + ' style="text-align:center;font-variant-numeric:tabular-nums;color:#6b7280;font-size:12px">'+(_dur?_dur+'天':'—')+'</td>';
       // ★ V0.1.49: 每行任务得分 — 完成状态在前，积分在后(与表头一致)
-      html+='<td class="'+edCls+' col-status" data-field="tasks.'+jj+'.status" data-type="select" data-opts="'+WP_STATUS_OPTIONS.join(',')+'"'+edClick+'>'+(tt.status?_renderStatusDot(tt.status):'<span style="color:var(--text-hint)">选择</span>')+'</td>';
+      html+='<td class="'+edCls+' col-status" data-field="tasks.'+jj+'.status" data-type="select" data-opts="'+WP_STATUS_OPTIONS.join(',')+'"'+edClick+'>'+(tt.status?_renderStatusDot(tt.status):'<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">选择</span>')+'</td>';
       html+=_renderTaskScoreCell(plan,jj);
       html+='<td class="'+edCls+' col-supporters" data-field="tasks.'+jj+'.supporters" data-type="text"'+edClick+'>'+_renderSupportersCell(plan,jj,tt.supporters)+'</td>';
-      html+='<td class="'+edCls+' col-wide" data-field="tasks.'+jj+'.problems" data-type="textarea"'+edClick+'>'+(tt.problems||plan._revisions&&plan._revisions['tasks.'+jj+'.problems']?renderWPCellValue(plan,'tasks.'+jj+'.problems',tt.problems):(tt.problems?_h(tt.problems):'<span style="color:var(--text-hint)">填写</span>'))+'</td>';
-      html+='<td class="'+edCls+' col-problemtype" data-field="tasks.'+jj+'.problemType" data-type="select" data-opts="'+WP_PROBLEM_OPTIONS.join(',')+'"'+edClick+'>'+(tt.problemType||plan._revisions&&plan._revisions['tasks.'+jj+'.problemType']?renderWPCellValue(plan,'tasks.'+jj+'.problemType',tt.problemType):(tt.problemType?_h(tt.problemType):'<span style="color:var(--text-hint)">选择</span>'))+'</td>';
+      // ★ j83: 清洗 col-problems 脏数据 — 历史数据可能有"填写"作为实际值
+      var _cleanProblems=_cleanPlaceholderText(tt.problems);
+      html+='<td class="'+edCls+' col-wide" data-field="tasks.'+jj+'.problems" data-type="textarea"'+edClick+'>'+(_cleanProblems?(plan._revisions&&plan._revisions['tasks.'+jj+'.problems']?renderWPCellValue(plan,'tasks.'+jj+'.problems',_cleanProblems):_h(_cleanProblems)):'<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">填写</span>')+'</td>';
+      html+='<td class="'+edCls+' col-problemtype" data-field="tasks.'+jj+'.problemType" data-type="select" data-opts="'+WP_PROBLEM_OPTIONS.join(',')+'"'+edClick+'>'+(tt.problemType||plan._revisions&&plan._revisions['tasks.'+jj+'.problemType']?renderWPCellValue(plan,'tasks.'+jj+'.problemType',tt.problemType):(tt.problemType?_h(tt.problemType):'<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">选择</span>'))+'</td>';
       html+='<td class="'+edCls+' col-needboss" data-field="tasks.'+jj+'.needBoss" data-type="select" data-opts="'+WP_NEEDBOSS_OPTIONS.join(',')+'"'+edClick+'>'+renderWPCellValue(plan,'tasks.'+jj+'.needBoss',tt.needBoss||'')+'</td>';
-      // ★ V0.3.36: 备注说明(员工自填，新列)
-      html+='<td class="'+edCls+' col-remarks" data-field="tasks.'+jj+'.remarks" data-type="textarea"'+edClick+'>'+(tt.remarks||plan._revisions&&plan._revisions['tasks.'+jj+'.remarks']?renderWPCellValue(plan,'tasks.'+jj+'.remarks',tt.remarks):(tt.remarks?_h(tt.remarks):'<span style="color:var(--text-hint)">备注</span>'))+'</td>';
+      // ★ j83: 清洗 col-remarks 脏数据
+      var _cleanRemarks=_cleanPlaceholderText(tt.remarks);
+      html+='<td class="'+edCls+' col-remarks" data-field="tasks.'+jj+'.remarks" data-type="textarea"'+edClick+'>'+(_cleanRemarks?(plan._revisions&&plan._revisions['tasks.'+jj+'.remarks']?renderWPCellValue(plan,'tasks.'+jj+'.remarks',_cleanRemarks):_h(_cleanRemarks)):'<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">备注</span>')+'</td>';
       var bossCanEdit=isMySubordinate(plan.name) || !!_wpViewingDeptMember;
-      html+='<td class="col-boss'+(bossCanEdit?' editable':'')+'"'+(bossCanEdit?' data-field="tasks.'+jj+'.bossFeedback" data-type="textarea" onclick="startEditCell(this)"':'')+'>'+(tt.bossFeedback?_h(tt.bossFeedback):(plan._revisions&&plan._revisions['tasks.'+jj+'.bossFeedback']?renderWPCellValue(plan,'tasks.'+jj+'.bossFeedback',tt.bossFeedback):'<span style="color:var(--text-hint)">上级建议</span>'))+'</td>';
+      // ★ j83: 清洗 col-bossFeedback 脏数据
+      var _cleanBossFb=_cleanPlaceholderText(tt.bossFeedback);
+      html+='<td class="col-boss'+(bossCanEdit?' editable':'')+'"'+(bossCanEdit?' data-field="tasks.'+jj+'.bossFeedback" data-type="textarea" onclick="startEditCell(this)"':'')+'>'+(_cleanBossFb?_h(_cleanBossFb):(plan._revisions&&plan._revisions['tasks.'+jj+'.bossFeedback']?renderWPCellValue(plan,'tasks.'+jj+'.bossFeedback',tt.bossFeedback):'<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">上级建议</span>'))+'</td>';
       html+='</tr>';
     }
     html+='<tr class="wp-section-header" style="background:#F0F9FF"><td colspan="16" style="padding:6px 12px;font-size:12px;font-weight:600;color:#0369A1;border-bottom:2px solid #BAE6FD">📝 本周新增（'+newTasks.length+'项）</td></tr>';
@@ -2730,15 +3145,15 @@ function renderWPTable(plan){
     html+='<tr data-task-idx="'+j+'">';
     // ★ V0.1.59: # 列 — +/- 操作按钮
     html+=_renderTaskOpCell(j,seq,plan);
-    html+='<td class="editable col-work'+_frozenCls+'" data-field="tasks.'+j+'.work" data-type="textarea" onclick="startEditCell(this)">'+(t.work||plan._revisions&&plan._revisions['tasks.'+j+'.work']?renderWPCellValue(plan,'tasks.'+j+'.work',t.work):(t.work?_hWork(t.work):'<span style="color:var(--text-hint)">点击填写</span>'))+'</td>';
+    html+='<td class="editable col-work'+_frozenCls+'" data-field="tasks.'+j+'.work" data-type="textarea" onclick="startEditCell(this)">'+(t.work||plan._revisions&&plan._revisions['tasks.'+j+'.work']?renderWPCellValue(plan,'tasks.'+j+'.work',t.work):(t.work?_hWork(t.work):'<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">点击填写</span>'))+'</td>';
     var _goalRaw=t.goal||'';
     var _goalVal=renderWPCellValue(plan,'tasks.'+j+'.goal',t.goal);
     var _goalPriClass=_goalRaw==='重要紧急'?'pri-urgent':_goalRaw==='重要不急'?'pri-important':_goalRaw==='日常紧急'?'pri-daily-urgent':_goalRaw==='日常事项'?'pri-daily-routine':'';
-    html+='<td class="editable col-goal '+_goalPriClass+_frozenCls+'" data-field="tasks.'+j+'.goal" data-type="select" data-opts="'+WP_GOAL_OPTIONS.join(',')+'" onclick="startEditCell(this)">'+(_goalVal||'<span style="color:var(--text-hint)">选择</span>')+'</td>';
+    html+='<td class="editable col-goal '+_goalPriClass+_frozenCls+'" data-field="tasks.'+j+'.goal" data-type="select" data-opts="'+WP_GOAL_OPTIONS.join(',')+'" onclick="startEditCell(this)">'+(_goalVal||'<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">选择</span>')+'</td>';
     var startDateDisplay=renderWPCellValue(plan,'tasks.'+j+'.startDate',t.startDate||'');
-    html+='<td class="editable col-hours'+_frozenCls+'" data-field="tasks.'+j+'.startDate" data-type="date" onclick="startEditCell(this)">'+(startDateDisplay?startDateDisplay:'<span style="color:var(--text-hint)">点击选择日期</span>')+'</td>';
+    html+='<td class="editable col-hours'+_frozenCls+'" data-field="tasks.'+j+'.startDate" data-type="date" onclick="startEditCell(this)">'+(startDateDisplay?startDateDisplay:'<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">点击选择日期</span>')+'</td>';
     var plannedDateDisplay=renderWPCellValue(plan,'tasks.'+j+'.plannedDate',t.plannedDate||'');
-    html+='<td class="editable col-hours'+_frozenCls+'" data-field="tasks.'+j+'.plannedDate" data-type="date" onclick="startEditCell(this)">'+(plannedDateDisplay?plannedDateDisplay:'<span style="color:var(--text-hint)">点击选择日期</span>')+'</td>';
+    html+='<td class="editable col-hours'+_frozenCls+'" data-field="tasks.'+j+'.plannedDate" data-type="date" onclick="startEditCell(this)">'+(plannedDateDisplay?plannedDateDisplay:'<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">点击选择日期</span>')+'</td>';
     html+='<td class="col-remaining" style="text-align:center;font-size:12px">'+_calcRemainingDays(t.plannedDate||'',t.actualDate||'')+'</td>';
     var actualDateDisplay=renderWPCellValue(plan,'tasks.'+j+'.actualDate',t.actualDate||'');
     // ★ V0.4.91: 自动"未做"时锁定实际完成日期，显示"—"
@@ -2746,7 +3161,7 @@ function renderWPTable(plan){
     if(t.status==='未做'&&!t._manualNotDone){
       html+='<td class="col-hours'+_summaryFrozenCls+'" style="color:#9ca3af;cursor:not-allowed;text-align:center">—</td>';
     }else{
-      html+='<td class="editable col-hours'+_summaryFrozenCls+'" data-field="tasks.'+j+'.actualDate" data-type="date" onclick="startEditCell(this)">'+(actualDateDisplay?actualDateDisplay:'<span style="color:var(--text-hint)">点击选择日期</span>')+'</td>';
+      html+='<td class="editable col-hours'+_summaryFrozenCls+'" data-field="tasks.'+j+'.actualDate" data-type="date" onclick="startEditCell(this)">'+(actualDateDisplay?actualDateDisplay:'<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">点击选择日期</span>')+'</td>';
     }
     // ★ V0.4.91d/Q: 耗时列（自动计算，只读）+ 蓝色角标 + tooltip数据
     var _durNew=_calcTaskDuration(t);
@@ -2759,16 +3174,22 @@ function renderWPTable(plan){
     }
     html+='<td class="col-duration' + (_durNew?' has-duration':'') + '"' + (_durTip?' data-dur-tip="'+_durTip+'"':'') + ' style="text-align:center;font-variant-numeric:tabular-nums;color:#6b7280;font-size:12px">'+(_durNew?_durNew+'天':'—')+'</td>';
     // ★ V0.1.49: 每行任务积分
-    html+='<td class="editable col-status" data-field="tasks.'+j+'.status" data-type="select" data-opts="'+WP_STATUS_OPTIONS.join(',')+'" onclick="startEditCell(this)">'+(t.status?_renderStatusDot(t.status):'<span style="color:var(--text-hint)">选择</span>')+'</td>';
+    html+='<td class="editable col-status" data-field="tasks.'+j+'.status" data-type="select" data-opts="'+WP_STATUS_OPTIONS.join(',')+'" onclick="startEditCell(this)">'+(t.status?_renderStatusDot(t.status):'<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">选择</span>')+'</td>';
     html+=_renderTaskScoreCell(plan,j);
     html+='<td class="editable col-supporters" data-field="tasks.'+j+'.supporters" data-type="text" onclick="startEditCell(this)">'+_renderSupportersCell(plan,j,t.supporters)+'</td>';
-    html+='<td class="editable col-wide" data-field="tasks.'+j+'.problems" data-type="textarea" onclick="startEditCell(this)">'+(t.problems||plan._revisions&&plan._revisions['tasks.'+j+'.problems']?renderWPCellValue(plan,'tasks.'+j+'.problems',t.problems):(t.problems?_h(t.problems):'<span style="color:var(--text-hint)">填写</span>'))+'</td>';
-    html+='<td class="editable col-problemtype" data-field="tasks.'+j+'.problemType" data-type="select" data-opts="'+WP_PROBLEM_OPTIONS.join(',')+'" onclick="startEditCell(this)">'+(t.problemType||plan._revisions&&plan._revisions['tasks.'+j+'.problemType']?renderWPCellValue(plan,'tasks.'+j+'.problemType',t.problemType):(t.problemType?_h(t.problemType):'<span style="color:var(--text-hint)">选择</span>'))+'</td>';
+    var _problemKey='tasks.'+j+'.problems';
+    var _problemRevision=plan._revisions&&plan._revisions[_problemKey];
+    var _problemDisplay=_normalizeProblemPlaceholder(_problemRevision?_problemRevision.value:t.problems);
+    html+='<td class="editable col-wide" data-field="'+_problemKey+'" data-type="textarea" onclick="startEditCell(this)">'+(_problemDisplay?_h(_problemDisplay):'<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">填写</span>')+'</td>';
+    html+='<td class="editable col-problemtype" data-field="tasks.'+j+'.problemType" data-type="select" data-opts="'+WP_PROBLEM_OPTIONS.join(',')+'" onclick="startEditCell(this)">'+(t.problemType||plan._revisions&&plan._revisions['tasks.'+j+'.problemType']?renderWPCellValue(plan,'tasks.'+j+'.problemType',t.problemType):(t.problemType?_h(t.problemType):'<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">选择</span>'))+'</td>';
     html+='<td class="editable col-needboss" data-field="tasks.'+j+'.needBoss" data-type="select" data-opts="'+WP_NEEDBOSS_OPTIONS.join(',')+'" onclick="startEditCell(this)">'+renderWPCellValue(plan,'tasks.'+j+'.needBoss',t.needBoss||'')+'</td>';
     // ★ V0.3.36: 备注说明(员工自填，新列)
-    html+='<td class="editable col-remarks" data-field="tasks.'+j+'.remarks" data-type="textarea" onclick="startEditCell(this)">'+(t.remarks||plan._revisions&&plan._revisions['tasks.'+j+'.remarks']?renderWPCellValue(plan,'tasks.'+j+'.remarks',t.remarks):(t.remarks?_h(t.remarks):'<span style="color:var(--text-hint)">备注</span>'))+'</td>';
+    // ★ j83: 清洗脏数据
+    var _cleanNewRemarks=_cleanPlaceholderText(t.remarks);
+    html+='<td class="editable col-remarks" data-field="tasks.'+j+'.remarks" data-type="textarea" onclick="startEditCell(this)">'+(_cleanNewRemarks?(plan._revisions&&plan._revisions['tasks.'+j+'.remarks']?renderWPCellValue(plan,'tasks.'+j+'.remarks',_cleanNewRemarks):_h(_cleanNewRemarks)):'<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">备注</span>')+'</td>';
     var bossCanEdit=isMySubordinate(plan.name) || !!_wpViewingDeptMember;
-    html+='<td class="col-boss'+(bossCanEdit?' editable':'')+'"'+(bossCanEdit?' data-field="tasks.'+j+'.bossFeedback" data-type="textarea" onclick="startEditCell(this)"':'')+'>'+(t.bossFeedback?_h(t.bossFeedback):(plan._revisions&&plan._revisions['tasks.'+j+'.bossFeedback']?renderWPCellValue(plan,'tasks.'+j+'.bossFeedback',t.bossFeedback):'<span style="color:var(--text-hint)">上级建议</span>'))+'</td>';
+    var _cleanNewBossFb=_cleanPlaceholderText(t.bossFeedback);
+    html+='<td class="col-boss'+(bossCanEdit?' editable':'')+'"'+(bossCanEdit?' data-field="tasks.'+j+'.bossFeedback" data-type="textarea" onclick="startEditCell(this)"':'')+'>'+(_cleanNewBossFb?_h(_cleanNewBossFb):(plan._revisions&&plan._revisions['tasks.'+j+'.bossFeedback']?renderWPCellValue(plan,'tasks.'+j+'.bossFeedback',t.bossFeedback):'<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">上级建议</span>'))+'</td>';
     html+='</tr>';
   }
 
@@ -2785,7 +3206,7 @@ function renderWPTable(plan){
   html+='<td class="wp-total-num" style="color:'+(overdue>0?'var(--danger)':'var(--success)')+'">'+overdue+' 项</td>'; // 问题类型
   html+='<td colspan="3" style="background:#FBF8F3"></td>'; // 需上级+备注+上级评价
   html+='</tr>';
-  html+='</tbody></table></div>';
+  html+='</tbody></table></div></div></div>';
 
   // ===== 协同任务区域（独立表格，来自其他同事的协同请求）=====
   html+=_renderCollabTasksSection(plan);
@@ -2807,7 +3228,7 @@ function renderWPTable(plan){
   if(plan.aiAnalysis && plan.aiAnalysis.trim()){
     html+='<div class="wp-feedback-textarea" id="aiAnalysisContent" style="background:#F4F0FF;border:1px solid #d4c8f0;font-size:13px;line-height:1.8;white-space:pre-wrap;transition:max-height 0.6s cubic-bezier(.25,.1,.25,1),opacity 0.6s cubic-bezier(.25,.1,.25,1),padding 0.6s cubic-bezier(.25,.1,.25,1);overflow:hidden;max-height:0;opacity:0;padding:0;margin-top:0">'+_h(plan.aiAnalysis)+'</div>';
   }else{
-    html+='<div class="wp-feedback-empty" id="aiAnalysisContent" style="background:#F4F0FF;border:1px dashed #d4c8f0;transition:max-height 0.6s cubic-bezier(.25,.1,.25,1),opacity 0.6s cubic-bezier(.25,.1,.25,1),padding 0.6s cubic-bezier(.25,.1,.25,1);max-height:0;opacity:0;padding:0">点击上方「AI-分析建议」按钮，生成本周整体分析报告</div>';
+    html+='<div class="wp-feedback-empty" id="aiAnalysisContent" style="background:#F4F0FF;border:1px dashed #d4c8f0;transition:max-height 0.6s cubic-bezier(.25,.1,.25,1),opacity 0.6s cubic-bezier(.25,.1,.25,1),padding 0.6s cubic-bezier(.25,.1,.25,1);max-height:0;opacity:0;padding:0">点击上方「AI 建议」按钮，生成本周整体分析报告</div>';
   }
   html+='</div>';
 
@@ -2828,7 +3249,7 @@ function renderWPTable(plan){
     for(var mi=0;mi<moods.length;mi++){
       var m=moods[mi];
       var isSel=currentMoods.indexOf(m.key)>=0;
-      html+='<span class="wp-mood-emoji '+m.cls+(isSel?' mood-selected':'')+'" data-mood-key="'+m.key+'" data-tip="'+m.label+'" onclick="saveWPMood(\''+m.key+'\',this)" title="'+m.label+'">'+m.emoji+'</span>';
+      html+='<span class="wp-mood-emoji '+m.cls+(isSel?' mood-selected':'')+'" data-mood-key="'+m.key+'" data-tip="'+m.label+'" onmousedown="event.preventDefault()" onclick="saveWPMood(\''+m.key+'\',this)" title="'+m.label+'">'+m.emoji+'</span>';
     }
     html+='</div>';
   }else if(summaryContent){
@@ -2905,27 +3326,21 @@ function renderWPTable(plan){
   
   html+='</div>';
 
-  html+='</div>'; /* close wp-scroll-area */
+  html+='</div>'; /* close wp-page-scroll */
 
   // ★ V0.6.1cd: 恢复排序前的原始plan.tasks
   if(_wpOrigTasks)plan.tasks=_wpOrigTasks;
 
   content.insertAdjacentHTML('beforeend',html);
 
-  // ★ V0.5.190: 恢复 .wp-scroll-area 的滚动位置（这才是真正的滚动容器！）
-  var _newScroll=content.querySelector('.wp-scroll-area');
-  if(_newScroll&&_savedScrollTop>0)_newScroll.scrollTop=_savedScrollTop;
-  if(_newScroll&&_savedScrollLeft>0)_newScroll.scrollLeft=_savedScrollLeft;
+  // 恢复各自滚动位置：页面仅纵向滚动，表格仅横向滚动。
+  var _newPageScroll=content.querySelector('.wp-page-scroll');
+  var _newTableScroll=content.querySelector('.wp-table-x-scroll');
+  if(_newPageScroll&&_savedScrollTop>0)_newPageScroll.scrollTop=_savedScrollTop;
+  if(_newTableScroll&&_savedScrollLeft>0)_newTableScroll.scrollLeft=_savedScrollLeft;
 
-  // V0.5.157: 水平滚动时反向移动工具栏等非表格元素
-  setTimeout(function(){
-    var sc=content.querySelector('.wp-scroll-area')||content;
-    sc.addEventListener('scroll',function(){
-      var sl=sc.scrollLeft;
-      var els=content.querySelectorAll('.wp-info-bar, .wp-toolbar, .wp-summary-bar, .wp-feedback-sections, #collabTaskArea, #wpTimeMgmtPanel');
-      for(var i=0;i<els.length;i++)els[i].style.transform='translateX('+sl+'px)';
-    });
-  },10);
+  // 周计划表头吸顶：克隆表头，随页面纵滚显示并与任务表横滚同步。
+  _bindWPStickyTableHeader(content);
 
   // ★ V0.5.67: 绑定拖拽事件
   setTimeout(function(){_bindWPDragEvents();},50);
@@ -3175,10 +3590,10 @@ function startEditCell(cell){
     var selEl=cell.querySelector('select');if(selEl){selEl.focus();selEl.addEventListener('blur',function(){commitEditCell(this);});}
   }else if(type==='textarea'){
     cell.innerHTML='<textarea class="wp-cell-textarea" onblur="commitEditCell()">'+_h(cur)+'</textarea>';
-    var ta=cell.querySelector('textarea');if(ta)ta.focus();
+    var ta=cell.querySelector('textarea');if(ta){_wpBindLiveTaskPersistence(cell,ta);ta.focus();}
   }else if(type==='number'){
     cell.innerHTML='<input class="wp-cell-input" type="number" step="0.5" min="0" value="'+_h(cur)+'" onblur="commitEditCell()">';
-    var inp=cell.querySelector('input');if(inp)inp.focus();
+    var inp=cell.querySelector('input');if(inp){_wpBindLiveTaskPersistence(cell,inp);inp.focus();}
   }else if(type==='date'){
     // 计划完成日期：HTML5 原生日历选择器
     var dateVal=cur;
@@ -3191,7 +3606,7 @@ function startEditCell(cell){
       }
     }
     cell.innerHTML='<input class="wp-cell-input" type="date" value="'+_h(dateVal)+'" onblur="commitEditCell()" onchange="commitEditCell(this)">';
-    var dEl=cell.querySelector('input');if(dEl){dEl.focus();dEl.style.minWidth='120px';}
+    var dEl=cell.querySelector('input');if(dEl){_wpBindLiveTaskPersistence(cell,dEl);dEl.focus();dEl.style.minWidth='120px';}
   }else{
     // ★ V0.6.1.gv: 协同人列 — chip 标签 + 自定义 portal 下拉
     var isSupporters=field&&field.indexOf('.supporters')>=0;
@@ -3296,7 +3711,7 @@ function startEditCell(cell){
       setTimeout(function(){inp.focus();},30);
     }else{
       cell.innerHTML='<input class="wp-cell-input" type="text" value="'+_h(cur)+'" onblur="commitEditCell()">';
-      var inp2=cell.querySelector('input');if(inp2)inp2.focus();
+      var inp2=cell.querySelector('input');if(inp2){_wpBindLiveTaskPersistence(cell,inp2);inp2.focus();}
     }
   }
 }
@@ -3408,6 +3823,96 @@ async function commitEditCell(el){
 }
 
 // ========== 工具栏操作 ==========
+// 将当前页面仍存在的编辑控件强制写回 plan。不能只依赖 blur/_wpEditCell：点击顶部按钮时，浏览器事件顺序可能已清空编辑标记。
+function _wpFlushVisibleEdits(){
+  var p=_wpCurrent&&_wpCurrent.plan;
+  var root=document.getElementById('wpContent');
+  if(!p||!p.tasks||!root)return false;
+  var changed=false;
+  var cells=root.querySelectorAll('td[data-field]');
+  for(var i=0;i<cells.length;i++){
+    var cell=cells[i], field=cell.dataset.field||'';
+    var control=cell.querySelector('input,textarea,select');
+    if(!control||field.indexOf('tasks.')!==0)continue;
+    var parts=field.split('.'), ti=parseInt(parts[1]), prop=parts[2];
+    if(isNaN(ti)||!prop||!p.tasks[ti])continue;
+    var value=control.value;
+    if(prop==='supporters'){
+      var chips=cell.querySelectorAll('.supporter-chip span:first-child');
+      if(chips.length){
+        var names=[];
+        for(var c=0;c<chips.length;c++){var name=chips[c].textContent.trim();if(name)names.push(name);}
+        value=names.join(',');
+      }
+    }
+    if(p.tasks[ti][prop]!==value){
+      p.tasks[ti][prop]=value;
+      changed=true;
+    }
+  }
+  if(changed){
+    p.updatedAt=new Date().toISOString();
+    _calcWeekScore(p);
+    _wpData[makeWPId(p.year,p.month,p.week)]=p;
+  }
+  return changed;
+}
+
+// 顶部“保存并返回首页”必须独立处理：心情操作会保留输入焦点，离开前由 DOM 级兜底提交所有可见编辑值。
+async function saveWPAndGoHome(){
+  try{
+    // ★ j79: 强制DOM扫描 — 不从 _wpCurrent.plan 读，直接从页面上所有 td[data-field] 读取
+    var p=_wpCurrent&&_wpCurrent.plan;
+    if(!p||!_wpCurrent.year||_wpViewingShared)return goHome();
+
+    // ★ 直接扫描DOM — 无论 textarea 是否已提交，强制读取可见值
+    var root=document.getElementById('wpContent');
+    var scannedAny=false;
+    if(root&&p.tasks){
+      var cells=root.querySelectorAll('td[data-field]');
+      for(var ci=0;ci<cells.length;ci++){
+        var cell=cells[ci], field=cell.dataset.field||'';
+        if(field.indexOf('tasks.')!==0)continue;
+        var parts=field.split('.'), ti=parseInt(parts[1]), prop=parts[2];
+        if(isNaN(ti)||!prop||!p.tasks[ti])continue;
+        // 优先从textarea/input直接读，兜底读textContent
+        var ctrl=cell.querySelector('input,textarea,select');
+        var value=ctrl?ctrl.value:cell.textContent.replace(/点击填写|选择|点击选择日期|备注|上级建议/g,'').trim();
+        if(prop==='supporters'){
+          var chips=cell.querySelectorAll('.supporter-chip span:first-child');
+          if(chips.length){var names=[];for(var cx=0;cx<chips.length;cx++){var n=chips[cx].textContent.trim();if(n)names.push(n);}value=names.join(',');}
+        }
+        if(value!==p.tasks[ti][prop]){
+          p.tasks[ti][prop]=value;
+          scannedAny=true;
+        }
+      }
+    }
+
+    // 也检查并提交当前编辑中的cell
+    _wpFlushVisibleEdits();
+    if(_wpEditCell)await commitEditCell();
+
+    p.updatedAt=new Date().toISOString();
+    _calcWeekScore(p);
+    var id=makeWPId(p.year,p.month,p.week);
+    _wpData[id]=p;
+    
+    // ★ j79 diagnostic: 保存前打印内容
+    var workPreview=p.tasks&&p.tasks[0]?p.tasks[0].work:'';
+    console.log('[J79 SAVE] '+id+' task0work="'+workPreview.substr(0,40)+'" scanned='+scannedAny+' totalTasks='+(p.tasks?p.tasks.length:0));
+
+    // 先写 localStorage，再写云端（只写当前周）
+    localStorage.setItem(getWPLocalStorageKey(),JSON.stringify(_wpData));
+    await saveWPData(id);
+  }catch(e){
+    console.error('[WP] 保存并返回首页失败:',e);
+    if(typeof showToast==='function')showToast('⚠️ 周计划保存失败，请重试','warning');
+    return;
+  }
+  goHome();
+}
+
 // ★ V0.1.35: 「完成提交」按钮 — 记录首次提交时间并保存
 async function submitWPPlan(){
   var p=_wpCurrent.plan;if(!p){_showAlert('请先选择一个周计划');return;}
@@ -3690,10 +4195,12 @@ function _calcWeekScore(plan){
   weekScore+=taskScore;
 
   // ★ V0.6.1.hh: 上级评级加分（金+2 银+1 铜0 待改-1 严重-2）
+  // 奖牌选择即为有效评级；撤销完整评价或再次点击同一奖牌都会清空 weeklyRating，因此空值不会参与积分。
   var ratingScore=0;
   var ratingMap={gold:2, silver:1, bronze:0, warn:-1, danger:-2};
-  if(plan.weeklyRating && ratingMap[plan.weeklyRating]!==undefined){
-    ratingScore=ratingMap[plan.weeklyRating];
+  var effectiveRating=plan.weeklyRating||'';
+  if(effectiveRating && ratingMap[effectiveRating]!==undefined){
+    ratingScore=ratingMap[effectiveRating];
   }
   weekScore+=ratingScore;
 
@@ -3708,7 +4215,7 @@ function _calcWeekScore(plan){
     onTimeScore:onTimeScore, overdueScore:overdueScore,
     notDoneScore:notDoneScore, lateSubmitScore:lateSubmitScore,
     reviewScore:reviewScore, onTimeSubmitScore:onTimeSubmitScore,
-    ratingScore:ratingScore, weeklyRating:plan.weeklyRating||''
+    ratingScore:ratingScore, weeklyRating:effectiveRating
   };
 
   // 重新汇总（含明细 + 兼容旧数据）
@@ -3786,11 +4293,8 @@ var _EM_POS_MAP={'重要紧急':{x:'right',y:'top'},'重要不急':{x:'left',y:'
 function _renderEisenhowerMatrix(year){
   var tasks=_collectYearTasks(year);
   var html='<div class="wp-card">';
-  var toggleIcon=_matrixExpanded?'▲':'▼';
-  var toggleText=_matrixExpanded?'收起':'展开';
-  var contentStyle=_matrixExpanded?'transition:max-height 0.6s cubic-bezier(.25,.1,.25,1),opacity 0.6s cubic-bezier(.25,.1,.25,1);overflow:hidden':'transition:max-height 0.6s cubic-bezier(.25,.1,.25,1),opacity 0.6s cubic-bezier(.25,.1,.25,1);overflow:hidden;max-height:0;opacity:0';
-  html+='<div class="wp-card-title">🎯 艾森豪威尔矩阵<button type="button" onclick="toggleEisenhowerMatrix()" id="matrixToggleBtn" style="margin-left:auto;padding:2px;border:none;border-radius:6px;background:transparent;color:#D9D9D9;font-size:13px;font-weight:400;cursor:pointer;display:inline-flex;align-items:center;gap:3px;transition:all .25s ease;white-space:nowrap"><span id="matrixToggleIcon" style="color:#D9D9D9">'+toggleIcon+'</span><span id="matrixToggleText">'+toggleText+'</span></button></div>';
-  html+='<div id="matrixContent" style="'+contentStyle+'">';
+  html+='<div class="wp-card-title">🎯 艾森豪威尔矩阵</div>';
+  html+='<div>';
   if(tasks.length===0){
     html+='<div style="text-align:center;color:#9ca3af;font-size:11px;padding:40px 0">暂无年度计划数据</div>';
     html+='</div></div>'; return html;
@@ -3876,11 +4380,8 @@ function _renderAnnualProgress(year){
   }
   var allQuads=['重要紧急','重要不急','日常紧急','日常事项'];
   var totalCount=0,totalDone=0;
-  var toggleIcon = _progressExpanded ? '▲' : '▼';
-  var toggleText = _progressExpanded ? '收起' : '展开';
-  var contentStyle = _progressExpanded ? 'transition:max-height 0.6s cubic-bezier(.25,.1,.25,1),opacity 0.6s cubic-bezier(.25,.1,.25,1);overflow:hidden' : 'transition:max-height 0.6s cubic-bezier(.25,.1,.25,1),opacity 0.6s cubic-bezier(.25,.1,.25,1);overflow:hidden;max-height:0;opacity:0';
-  var html='<div class="wp-card wp-progress-card"><div class="wp-card-title">⏰ '+year+'年年度计划完成率<button type="button" onclick="toggleAnnualProgress()" id="progressToggleBtn" style="margin-left:auto;padding:2px;border:none;border-radius:6px;background:transparent;color:#D9D9D9;font-size:13px;font-weight:400;cursor:pointer;display:inline-flex;align-items:center;gap:3px;transition:all .25s ease;white-space:nowrap"><span id="progressToggleIcon" style="color:#D9D9D9">'+toggleIcon+'</span><span id="progressToggleText">'+toggleText+'</span></button></div>';
-  html+='<div id="progressContent" style="'+contentStyle+'">';
+  var html='<div class="wp-card wp-progress-card"><div class="wp-card-title">⏰ '+year+'年年度计划完成率</div>';
+  html+='<div>';
   for(var qi=0;qi<allQuads.length;qi++){
     var q=allQuads[qi];
     var total=quads[q].length;
@@ -3937,13 +4438,15 @@ function _renderTimeManagementPanel(plan){
   }
 
   var html='';
-  var _cs=function(id){return _wpCardExpanded[id]?'transition:max-height 0.6s cubic-bezier(.25,.1,.25,1),opacity 0.6s cubic-bezier(.25,.1,.25,1);overflow:hidden':'transition:max-height 0.6s cubic-bezier(.25,.1,.25,1),opacity 0.6s cubic-bezier(.25,.1,.25,1);overflow:hidden;max-height:0;opacity:0';};
-  html+='<div class="wp-cards-grid" id="wpTimeMgmtPanel">';
+  html+='<section class="wp-overview" id="wpTimeMgmtPanel" onmouseenter="_cancelWPOverviewAutoCollapse()" onmouseleave="_scheduleWPOverviewAutoCollapse()" onfocusin="_cancelWPOverviewAutoCollapse()" onfocusout="_scheduleWPOverviewAutoCollapse()">';
+  html+='<button type="button" class="wp-overview-toggle" onclick="toggleWPOverview()" aria-expanded="'+(_wpOverviewExpanded?'true':'false')+'"><span class="wp-overview-title">本周概览</span><span class="wp-overview-hint">规则、积分与进度</span><span class="wp-overview-icon" id="wpOverviewIcon">'+(_wpOverviewExpanded?'收起 ▲':'展开 ▼')+'</span></button>';
+  html+='<div class="wp-overview-content" id="wpOverviewContent" style="'+(_wpOverviewExpanded?'max-height:1600px;opacity:1':'max-height:0;opacity:0')+'">';
+  html+='<div class="wp-cards-grid">';
 
   // ★ Card 1: 计分规则（V0.4.91 新规则）
   html+='<div class="wp-card">';
-  html+='<div class="wp-card-title">📋 计分规则</div>';
-  html+='<div id="wpCardContent_rules" style="'+_cs('rules')+'">';
+  html+='<div class="wp-card-title">计分规则</div>';
+  html+='<div>';
   html+='<table class="wp-card-table">';
   html+='<tr><td><span style="color:#059669;margin-right:6px">✓</span>周六12:00前提交上周小结</td><td class="td-val td-pos" style="color:#059669;font-weight:600">+0.5</td></tr>';
   html+='<tr><td><span style="color:#059669;margin-right:6px">✓</span>周六12:00前提交下周计划</td><td class="td-val td-pos" style="color:#059669;font-weight:600">+0.5</td></tr>';
@@ -3958,8 +4461,8 @@ function _renderTimeManagementPanel(plan){
 
   // ★ Card 2: 评分标准（V0.4.91 新分值）
   html+='<div class="wp-card">';
-  html+='<div class="wp-card-title">📊 评分标准</div>';
-  html+='<div id="wpCardContent_scores" style="'+_cs('scores')+'">';
+  html+='<div class="wp-card-title">评分标准</div>';
+  html+='<div>';
   html+='<table class="wp-card-table">';
   html+='<tr><td></td><td class="td-val" style="color:#6b7280;font-weight:400;font-size:10px">按时</td><td class="td-val" style="color:#6b7280;font-weight:400;font-size:10px">逾期</td><td class="td-val" style="color:#6b7280;font-weight:400;font-size:10px">未做</td></tr>';
   html+='<tr><td>重要紧急</td><td class="td-val td-pos">+3</td><td class="td-val td-neg">−1.5</td><td class="td-val td-neg">−5</td></tr>';
@@ -3973,8 +4476,8 @@ function _renderTimeManagementPanel(plan){
 
   // ★ Card 3: 完成状态
   html+='<div class="wp-card">';
-  html+='<div class="wp-card-title">⏰ 完成状态</div>';
-  html+='<div id="wpCardContent_status" style="'+_cs('status')+'">';
+  html+='<div class="wp-card-title">完成状态</div>';
+  html+='<div>';
   html+='<table class="wp-card-table">';
   html+='<tr><td style="color:#6b7280;width:32px">提交</td><td style="color:#0F2C4B">'+subTime+'</td></tr>';
   html+='</table>';
@@ -3990,8 +4493,8 @@ function _renderTimeManagementPanel(plan){
   // ★ Card 4: 年度积分（明细版）
   var netVal=scores.net||0;
   html+='<div class="wp-card">';
-  html+='<div class="wp-card-title">📊 '+year+'年积分</div>';
-  html+='<div id="wpCardContent_points" style="'+_cs('points')+'">';
+  html+='<div class="wp-card-title">'+year+'年积分</div>';
+  html+='<div>';
   // 加分项
   var tos=scores.totalOnTime||0;
   if(tos>0)html+='<div class="wp-card-score-row"><span class="wp-card-score-label">按时完成</span><span class="wp-card-score-val" style="color:#059669">+'+tos+'</span></div>';
@@ -4034,6 +4537,8 @@ function _renderTimeManagementPanel(plan){
   html+=_renderAnnualProgress(year);
 
   html+='</div>';
+  html+='</div>';
+  html+='</section>';
   return html;
 }
 
@@ -4057,24 +4562,15 @@ async function deleteCurrentWPPlan(){
   }
   var ok=await _showConfirm('你确定要清空 '+p.year+'年'+p.month+'月第'+p.week+'周行动项内容？\n\n如确定，将清除本周行动项中已填写的所有内容。'+'\n\n—\n\nAre you sure you want to clear Week '+p.week+' of '+p.month+'/'+p.year+'?\n\nIf confirmed, all filled content in this week to-do will be permanently removed.','注意 / Attention');
   if(!ok)return;
-  // ★ V0.1.59: 重置为1行空白表单（保留 name/dept/position）
+  // ★ V0.6.1.j59: 删除必须移除真实记录，不能将空壳计划再写回云端；否则备份和跨端同步会导致已删除内容复现。
   var y=p.year, m=p.month, w=p.week;
-  var tasks=[];
-  for(var i=0;i<1;i++)tasks.push({seq:i+1,work:'',goal:'',startDate:'',plannedDate:'',actualDate:'',estimatedHours:'',status:'',supporters:'',problems:'',problemType:'',needBoss:'',bossFeedback:'',aiSuggestion:''});
-  p.tasks=tasks;
-  p.weekSummary='';
-  p.bossEvaluated=false;
-  p.bossEvaluatedAt=null;
-  p.bossEvaluatedBy='';
-  p.bossOverallFeedback='';
-  p.firstSubmittedAt=null;
-  p.summarySubmittedAt=null;
-  p.bossReviewedAt=null;
-  p.updatedAt=new Date().toISOString();
-  saveWP(y,m,w,p);
-  _calcWeekScore(p);
-  renderWPTable(p);
-  showToast('🗑 周行动项已重置为空白表单');
+  var deleted=await deleteWP(y,m,w);
+  if(!deleted)return;
+  _wpCurrent={year:null,month:null,week:null,plan:null};
+  showWPEmpty();
+  renderWPPlanList(y,m);
+  renderWPUserInfo();
+  showToast('🗑 本周行动项已彻底删除');
 }
 
 function exportCurrentWP(){
@@ -4275,7 +4771,7 @@ function viewBossEval(){
   for(var i=0;i<p.tasks.length;i++){
     var t=p.tasks[i];if(!t.work)continue;
     html+='<div style="margin-bottom:10px"><div style="font-weight:500;margin-bottom:3px;line-height:1.4">'+(i+1)+'. '+_h(t.work)+'</div>';
-    html+='<div style="padding:8px 12px;background:var(--bg);border-radius:6px;min-height:36px;white-space:pre-wrap;font-size:13px;line-height:1.6">'+(t.bossFeedback?_h(t.bossFeedback):'<span style="color:var(--text-hint)">（无）</span>')+'</div></div>';
+    html+='<div style="padding:8px 12px;background:var(--bg);border-radius:6px;min-height:36px;white-space:pre-wrap;font-size:13px;line-height:1.6">'+(t.bossFeedback?_h(t.bossFeedback):'<span style="color:#C0C0C0;font-style:italic;pointer-events:none;user-select:none">（无）</span>')+'</div></div>';
   }
   html+='</div>';
   html+='<div class="wp-eval-actions"><button class="wp-eval-submit" onclick="closeBossEval()">关闭</button></div>';
@@ -4345,6 +4841,8 @@ async function revokeBossEval(){
   p.bossEvaluated=false;
   p.bossEvaluatedAt=null;
   p.bossEvaluatedBy='';
+  // 撤销评价即撤销其整体评级：历史测试/误点奖牌不应进入积分、数据中心或评价明细。
+  p.weeklyRating='';
   p.updatedAt=new Date().toISOString();
   saveWP(p.year,p.month,p.week,p);
   renderWPTable(p);
@@ -4378,6 +4876,7 @@ function saveWPFeedback(field, value) {
 
 // ★ V0.6.1.hd / iq: 保存本周心情 — 最多选 2 种，点击同一表情可取消
 function saveWPMood(mood, el) {
+  // 表情按下时已阻止焦点转移，保留正在编辑的任务单元格，避免触发其重绘流程。
   var p = _wpCurrent.plan;
   if (!p) return;
   // 读取当前心情列表（兼容旧版单值字段）
@@ -4410,8 +4909,7 @@ function saveWPMood(mood, el) {
       allEmojis[i].classList.toggle('mood-selected', moodList.indexOf(key) >= 0);
     }
   }
-  // 重新渲染表格底色以刷新数据
-  selectWP(p.year, p.month, p.week);
+  // 选中态已在 DOM 中更新；此处不重绘周计划，避免重建滚动容器造成页面跳动。
   showToast(moodList.length > 0 ? ('💬 已选 ' + moodList.length + ' 种心情') : '💬 心情已清除', 'info');
 }
 
@@ -4419,17 +4917,44 @@ function saveWPMood(mood, el) {
 function saveWPRating(rating, el) {
   var p = _wpCurrent.plan;
   if (!p) return;
-  if (p.weeklyRating === rating) { p.weeklyRating = ''; }
-  else { p.weeklyRating = rating; }
-  p.updatedAt = new Date().toISOString();
-  // ★ V0.6.1.ht: 记录评分人 + 评分时间（用于数据中心「我评出的奖牌」统计）
-  if (currentUser && currentUser.name) {
-    p.bossEvaluatedBy = currentUser.name;
-    p.bossEvaluatedAt = new Date().toISOString();
+  if (p.weeklyRating === rating) {
+    p.weeklyRating = '';
+    // 取消奖牌时同步清空评级元数据，避免旧时间戳让后续统计误判为有效评价。
+    p.bossEvaluatedBy = '';
+    p.bossEvaluatedAt = null;
+  } else {
+    p.weeklyRating = rating;
+    // ★ V0.6.1.ht: 记录评分人 + 评分时间（用于数据中心「我评出的奖牌」统计）
+    if (currentUser && currentUser.name) {
+      p.bossEvaluatedBy = currentUser.name;
+      p.bossEvaluatedAt = new Date().toISOString();
+    }
   }
+  p.updatedAt = new Date().toISOString();
+  // ★ V0.6.1.j88: 修复奖牌点击导致页面上下滚动 — 改为就地更新 DOM，不再重渲染整表
+  // j70 之前已为心情表情做过类似修复；这里奖牌的 setTimeout → selectWP() 仍会触发 renderWPTable()
+  // 重建整张表格，导致浏览器重新计算滚动锚点，视觉上"页面上下抖一次"。
+  _calcWeekScore(p);
   saveWP(p.year, p.month, p.week, p);
-  // 触发积分重算
-  setTimeout(function(){ _calcWeekScore(p); selectWP(p.year, p.month, p.week); }, 100);
+  // 就地更新奖牌的 selected 状态
+  try {
+    var container = el && el.parentNode;
+    if (container) {
+      var allEmojis = container.querySelectorAll('.wp-rating-emoji');
+      for (var i = 0; i < allEmojis.length; i++) {
+        var emojiKey = allEmojis[i].getAttribute('data-tip') || '';
+        // 通过 onclick 的 rating 参数对比更安全：直接用 _wpCurrent.plan.weeklyRating
+        var selected = (_wpCurrent.plan.weeklyRating && (
+          (allEmojis[i].classList.contains('rating-gold') && _wpCurrent.plan.weeklyRating === 'gold') ||
+          (allEmojis[i].classList.contains('rating-silver') && _wpCurrent.plan.weeklyRating === 'silver') ||
+          (allEmojis[i].classList.contains('rating-bronze') && _wpCurrent.plan.weeklyRating === 'bronze') ||
+          (allEmojis[i].classList.contains('rating-warn') && _wpCurrent.plan.weeklyRating === 'warn') ||
+          (allEmojis[i].classList.contains('rating-danger') && _wpCurrent.plan.weeklyRating === 'danger')
+        ));
+        allEmojis[i].classList.toggle('rating-selected', !!selected);
+      }
+    }
+  } catch (e) {}
   showToast(p.weeklyRating ? '🏅 评级已记录' : '🏅 评级已清除', 'info');
 }
 
@@ -4615,9 +5140,37 @@ function calcAverage(arr) {
 // 增强版 AI 评估（异步，加载历史数据）
 // ★ V0.3.36: AI 综合分析折叠/展开
 var _aiExpanded = false;
-var _progressExpanded = false;
-var _matrixExpanded = false;
-var _wpCardExpanded = {rules:false,scores:false,status:false,points:false};
+var _wpOverviewExpanded = false;
+var _wpOverviewAutoCollapseTimer = null;
+function toggleWPOverview(forceState){
+  _wpOverviewExpanded=typeof forceState==='boolean'?forceState:!_wpOverviewExpanded;
+  var content=document.getElementById('wpOverviewContent');
+  var icon=document.getElementById('wpOverviewIcon');
+  var toggle=document.querySelector('#wpTimeMgmtPanel .wp-overview-toggle');
+  if(!content)return;
+  if(_wpOverviewExpanded){
+    content.style.maxHeight=content.scrollHeight+'px';
+    content.style.opacity='1';
+  }else{
+    content.style.maxHeight=content.scrollHeight+'px';
+    requestAnimationFrame(function(){content.style.maxHeight='0';content.style.opacity='0';});
+  }
+  if(icon)icon.textContent=_wpOverviewExpanded?'收起 ▲':'展开 ▼';
+  if(toggle)toggle.setAttribute('aria-expanded',_wpOverviewExpanded?'true':'false');
+  if(!_wpOverviewExpanded)_cancelWPOverviewAutoCollapse();
+}
+function _cancelWPOverviewAutoCollapse(){
+  if(_wpOverviewAutoCollapseTimer){clearTimeout(_wpOverviewAutoCollapseTimer);_wpOverviewAutoCollapseTimer=null;}
+}
+function _scheduleWPOverviewAutoCollapse(){
+  _cancelWPOverviewAutoCollapse();
+  if(!_wpOverviewExpanded||!window.matchMedia||!window.matchMedia('(hover:hover)').matches)return;
+  _wpOverviewAutoCollapseTimer=setTimeout(function(){
+    var panel=document.getElementById('wpTimeMgmtPanel');
+    if(!panel||panel.matches(':hover')||panel.contains(document.activeElement))return;
+    toggleWPOverview(false);
+  },5000);
+}
 function toggleAIAnalysis(){
   _aiExpanded = !_aiExpanded;
   var el = document.getElementById('aiAnalysisContent');
@@ -4643,97 +5196,6 @@ function toggleAIAnalysis(){
     el.style.marginTop = '-8px';
     icon.textContent = '▼';
     text.textContent = '展开';
-  }
-}
-// ★ V0.5.26: 年度达成率折叠/展开
-function toggleAnnualProgress(){
-  _progressExpanded = !_progressExpanded;
-  var el = document.getElementById('progressContent');
-  var icon = document.getElementById('progressToggleIcon');
-  var text = document.getElementById('progressToggleText');
-  if(!el) return;
-  if(_progressExpanded){
-    el.style.maxHeight = '200px'; // annual progress
-    el.style.opacity = '1';
-    icon.textContent = '▲';
-    text.textContent = '收起';
-  }else{
-    el.style.maxHeight = '0';
-    el.style.opacity = '0';
-    icon.textContent = '▼';
-    text.textContent = '展开';
-  }
-  _updateAutoCollapseForWPCards(); // ★ V0.5.175b
-}
-// ★ V0.5.27: 艾森豪威尔矩阵折叠/展开（联动4张计分卡）
-function toggleEisenhowerMatrix(){
-  _matrixExpanded = !_matrixExpanded;
-  var el = document.getElementById('matrixContent');
-  var icon = document.getElementById('matrixToggleIcon');
-  var text = document.getElementById('matrixToggleText');
-  if(!el) return;
-  if(_matrixExpanded){
-    el.style.maxHeight = '400px';
-    el.style.opacity = '1';
-    icon.textContent = '▲';
-    text.textContent = '收起';
-    // ★ V0.6.1dr: 同步展开4张计分卡
-    ['rules','scores','status','points'].forEach(function(id){
-      _wpCardExpanded[id]=true;
-      var cel=document.getElementById('wpCardContent_'+id);
-      var cbtn=document.getElementById('wpCardBtn_'+id);
-      if(cel){cel.style.maxHeight='300px';cel.style.opacity='1';}
-      if(cbtn)cbtn.textContent='▲';
-    });
-  }else{
-    el.style.maxHeight = '0';
-    el.style.opacity = '0';
-    icon.textContent = '▼';
-    text.textContent = '展开';
-    // ★ V0.6.1dr: 同步收起4张计分卡
-    ['rules','scores','status','points'].forEach(function(id){
-      _wpCardExpanded[id]=false;
-      var cel=document.getElementById('wpCardContent_'+id);
-      var cbtn=document.getElementById('wpCardBtn_'+id);
-      if(cel){cel.style.maxHeight='0';cel.style.opacity='0';}
-      if(cbtn)cbtn.textContent='▼';
-    });
-  }
-  _updateAutoCollapseForWPCards(); // ★ V0.5.175b
-}
-// ★ V0.5.28: 通用卡片折叠/展开
-function toggleWPCard(cardId){
-  _wpCardExpanded[cardId] = !_wpCardExpanded[cardId];
-  var el = document.getElementById('wpCardContent_'+cardId);
-  var btn = document.getElementById('wpCardBtn_'+cardId);
-  if(!el) return;
-  if(_wpCardExpanded[cardId]){
-    el.style.maxHeight = '300px';
-    el.style.opacity = '1';
-    if(btn) btn.textContent = '▲';
-  }else{
-    el.style.maxHeight = '0';
-    el.style.opacity = '0';
-    if(btn) btn.textContent = '▼';
-  }
-  // ★ V0.5.175: 更新自动收起监听
-  _updateAutoCollapseForWPCards();
-}
-// ★ V0.5.175: 时间管理卡片自动收起监听（修正：纳入所有展开状态）
-function _updateAutoCollapseForWPCards(){
-  var panel=document.getElementById('wpTimeMgmtPanel');
-  if(!panel)return;
-  var anyExpanded=false;
-  for(var k in _wpCardExpanded){if(_wpCardExpanded[k]){anyExpanded=true;break;}}
-  if(!anyExpanded)anyExpanded=!!_matrixExpanded;  // 艾森豪威尔矩阵
-  if(!anyExpanded)anyExpanded=!!_progressExpanded;  // 年度计划完成率
-  if(anyExpanded){
-    panel.onmouseenter=function(){if(typeof _stopAutoCollapse==='function')_stopAutoCollapse();};
-    panel.onmouseleave=function(){if(typeof _startAutoCollapse==='function')_startAutoCollapse();};
-  }else{
-    panel.onmouseenter=null;
-    panel.onmouseleave=null;
-    if(typeof _stopAutoCollapse==='function')_stopAutoCollapse();
   }
 }
 var _yearGridExpanded = true;
@@ -4873,11 +5335,11 @@ async function aiAssessWP() {
     saveWP(p.year, p.month, p.week, p);
     renderWPTable(p);
 
-    if (btn) { btn.disabled = false; btn.innerHTML = '<span style="line-height:1.5"><span style="font-size:16px;font-weight:700">AI</span><br>分析建议</span>'; }
+    if (btn) { btn.disabled = false; btn.innerHTML = '<span style="font-size:14px;font-weight:700">AI</span><span>建议</span>'; }
     _showAlert('AI 综合分析已生成，请查看下方「🤖 AI 综合分析」区域。');
   } catch (e) {
     console.error('[AI] 分析失败:', e);
-    if (btn) { btn.disabled = false; btn.innerHTML = '<span style="line-height:1.5"><span style="font-size:16px;font-weight:700">AI</span><br>分析建议</span>'; }
+    if (btn) { btn.disabled = false; btn.innerHTML = '<span style="font-size:14px;font-weight:700">AI</span><span>建议</span>'; }
     _showAlert('AI 分析失败：' + (e.message || '未知错误'));
   }
 }

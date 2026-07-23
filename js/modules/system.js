@@ -24,6 +24,8 @@ function sysInitModule(){
   var el=document.getElementById('sysHeaderUser');
   if(el&&currentUser)el.textContent='当前管理员：'+currentUser.name;
   sysRenderUserTable();
+  // ★ V0.6.1.j49: 初始化邮件通知开关按钮状态
+  _initEmailToggleStatus();
 }
 
 function sysRenderUserTable(){
@@ -867,4 +869,141 @@ function getRosterCenterForName(name){
 function getRosterDeptForName(name){
   var r=getRosterLookup();
   return r[name]?r[name].dept:'';
+}
+
+// ★ V0.6.1.j49: 邮件通知总开关 — 一键关闭/开启所有定时邮件
+var _EMAIL_TOGGLE_LOADING=false;
+async function sysToggleEmailNotifications(){
+  if(_EMAIL_TOGGLE_LOADING){return;}
+  var btn=document.getElementById('sysEmailToggle');
+  if(!btn)return;
+  
+  // 读当前状态
+  _EMAIL_TOGGLE_LOADING=true;
+  btn.disabled=true;
+  btn.textContent='⏳ 切换中…';
+  
+  try{
+    var supabase=window.supabaseClient||(typeof supabase!=='undefined'?supabase:null);
+    if(!supabase){
+      // fallback: 读 localStorage
+      var saved=localStorage.getItem('__hwm_email_toggle__');
+      var cur=saved==='false'?false:true;
+      var nw=!cur;
+      localStorage.setItem('__hwm_email_toggle__',String(nw));
+      _updateEmailToggleBtn(nw);
+      showToast(nw?'🔔 邮件通知已开启':'🔕 邮件通知已关闭');
+      return;
+    }
+    
+    // 读 Supabase 当前值
+    var {data:row}=await supabase.from('hwm_settings').select('value').eq('key','email_notifications').single();
+    var cur=(row&&row.value&&row.value.enabled!==false)?true:false;
+    var nw=!cur;
+    var reason='';
+
+    // 二次确认
+    var confirmMsg=nw?
+      '确认要开启邮件自动预警通知功能吗？':
+      '确认要关闭邮件自动预警通知功能吗？';
+    if(!confirm(confirmMsg)){
+      _updateEmailToggleBtn(cur);
+      showToast('已取消');
+      _EMAIL_TOGGLE_LOADING=false;
+      btn.disabled=false;
+      return;
+    }
+    reason=cur?'临时关闭':'开启通知';
+    
+    // 写 Supabase
+    var adminName=(currentUser&&currentUser.name)||'系统管理员';
+    await supabase.from('hwm_settings').upsert({
+      key:'email_notifications',
+      value:{enabled:nw,reason:reason,by:adminName,at:new Date().toISOString()},
+      updated_at:new Date().toISOString()
+    });
+    
+    _updateEmailToggleBtn(nw);
+    showToast(nw?'🔔 邮件通知已开启':'🔕 邮件通知已关闭');
+  }catch(e){
+    console.error('[EmailToggle] 切换失败',e);
+    showToast('⚠️ 切换失败: '+e.message);
+  }
+  _EMAIL_TOGGLE_LOADING=false;
+  btn.disabled=false;
+}
+
+function _updateEmailToggleBtn(enabled){
+  var btn=document.getElementById('sysEmailToggle');
+  if(!btn)return;
+  if(enabled){
+    btn.textContent='🔔 邮件通知：已开启';
+    btn.style.borderColor='#059669';btn.style.color='#059669';
+  }else{
+    btn.textContent='🔕 邮件通知：已关闭';
+    btn.style.borderColor='#dc2626';btn.style.color='#dc2626';
+  }
+}
+
+// ★ V0.6.1.j49: 页面加载时同步按钮状态
+async function _initEmailToggleStatus(){
+  var btn=document.getElementById('sysEmailToggle');
+  if(!btn)return;
+  try{
+    var supabase=window.supabaseClient||(typeof supabase!=='undefined'?supabase:null);
+    if(supabase){
+      var {data:row}=await supabase.from('hwm_settings').select('value').eq('key','email_notifications').single();
+      if(row&&row.value&&row.value.enabled===false){
+        _updateEmailToggleBtn(false);
+      }else{
+        _updateEmailToggleBtn(true);
+      }
+    }else{
+      // fallback localStorage
+      var saved=localStorage.getItem('__hwm_email_toggle__');
+      _updateEmailToggleBtn(saved!=='false');
+    }
+  }catch(e){
+    _updateEmailToggleBtn(true); // 默认开启
+  }
+}
+
+// ★ V0.6.1.kd: AI 邮箱配置 (SMTP) — 存储 SMTP 配置供 Edge Functions 发送邮件
+var _EMAIL_CONFIG_KEY='__hwm_email_config__';
+
+function sysGetEmailConfig(){
+  try{return JSON.parse(localStorage.getItem(_EMAIL_CONFIG_KEY)||'{}');}catch(e){return{};}
+}
+function sysSaveEmailConfig(){
+  var cfg={
+    smtpHost:(document.getElementById('ecSmtpHost').value||'').trim(),
+    smtpPort:parseInt(document.getElementById('ecSmtpPort').value)||465,
+    smtpSsl:document.getElementById('ecSmtpSsl').value==='true',
+    smtpUser:(document.getElementById('ecSmtpUser').value||'').trim(),
+    smtpPass:document.getElementById('ecSmtpPass').value||'',
+    senderName:(document.getElementById('ecSenderName').value||'').trim()||'MBO+AI 目标计划管理系统',
+    updatedAt:new Date().toISOString()
+  };
+  // 基础校验
+  if(!cfg.smtpHost){_showAlert('请填写 SMTP 服务器地址','📧 配置不完整');return;}
+  if(!cfg.smtpPort||cfg.smtpPort<1||cfg.smtpPort>65535){_showAlert('SMTP 端口必须在 1-65535 之间','📧 配置不合法');return;}
+  if(!cfg.smtpUser){_showAlert('请填写邮箱账号','📧 配置不完整');return;}
+  if(!cfg.smtpPass){_showAlert('请填写 SMTP 授权码','📧 配置不完整');return;}
+  try{localStorage.setItem(_EMAIL_CONFIG_KEY,JSON.stringify(cfg));}catch(e){_showAlert('保存失败:'+e.message,'错误');return;}
+  console.log('[EmailConfig] ✅ 已保存 SMTP 配置 →',cfg.smtpHost+':'+cfg.smtpPort+' user='+cfg.smtpUser);
+  _showAlert('AI 邮箱配置已保存!\\n\\n下次周一 8:30 周报推送和每日 8:00 到期预警将自动启用。','📧 保存成功');
+  sysCloseEmailConfigModal();
+}
+function sysOpenEmailConfig(){
+  var cfg=sysGetEmailConfig();
+  document.getElementById('ecSmtpHost').value=cfg.smtpHost||'smtp.mxhichina.com';
+  document.getElementById('ecSmtpPort').value=cfg.smtpPort||465;
+  document.getElementById('ecSmtpSsl').value=(cfg.smtpSsl===false)?'false':'true';
+  document.getElementById('ecSmtpUser').value=cfg.smtpUser||'';
+  document.getElementById('ecSmtpPass').value=cfg.smtpPass||'';
+  document.getElementById('ecSenderName').value=cfg.senderName||'MBO+AI 目标计划管理系统';
+  document.getElementById('sysEmailConfigModal').style.display='flex';
+}
+function sysCloseEmailConfigModal(){
+  document.getElementById('sysEmailConfigModal').style.display='none';
 }
